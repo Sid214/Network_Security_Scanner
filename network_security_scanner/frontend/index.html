@@ -1,0 +1,1118 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GuardNet — Network Intelligence Platform</title>
+  <meta name="description" content="GuardNet is an enterprise-grade network intelligence and security analysis platform for monitoring, scanning, and auditing local network devices.">
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="/css/styles.css">
+
+  <!-- Font Awesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════ -->
+<!--  APP SHELL                                                   -->
+<!-- ═══════════════════════════════════════════════ -->
+<div class="app-shell">
+
+  <!-- Mobile Overlay -->
+  <div class="sidebar-overlay" id="sidebar-overlay"></div>
+
+  <!-- ── SIDEBAR ── -->
+  <aside class="sidebar" id="sidebar">
+
+    <!-- Logo -->
+    <div class="sidebar-logo">
+      <div class="sidebar-logo-icon">
+        <i class="fa-solid fa-shield-halved"></i>
+      </div>
+      <div class="sidebar-logo-text">
+        <h1>GuardNet</h1>
+        <span style="color:var(--text-secondary)">Security Suite</span>
+      </div>
+    </div>
+
+    <!-- Nav -->
+    <nav>
+      <button class="nav-btn active" data-tab="dashboard" id="nav-dashboard">
+        <i class="fa-solid fa-chart-pie nav-icon"></i>
+        <span>Dashboard</span>
+      </button>
+      <button class="nav-btn" data-tab="devices" id="nav-devices">
+        <i class="fa-solid fa-laptop-code nav-icon"></i>
+        <span>Devices Inventory</span>
+      </button>
+      <button class="nav-btn" data-tab="scanner" id="nav-scanner">
+        <i class="fa-solid fa-satellite-dish nav-icon"></i>
+        <span>Network Scanner</span>
+      </button>
+      <button class="nav-btn" data-tab="alerts" id="nav-alerts">
+        <i class="fa-solid fa-triangle-exclamation nav-icon"></i>
+        <span>Threat Feed</span>
+        <span class="nav-badge" id="alerts-badge" style="display:none">0</span>
+      </button>
+      <button class="nav-btn" data-tab="history" id="nav-history">
+        <i class="fa-solid fa-clock-rotate-left nav-icon"></i>
+        <span>Scan History</span>
+      </button>
+      <button class="nav-btn" data-tab="settings" id="nav-settings">
+        <i class="fa-solid fa-sliders nav-icon"></i>
+        <span>Settings</span>
+      </button>
+    </nav>
+
+    <!-- Status Footer -->
+    <div class="sidebar-footer">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <div id="hb-dot" class="hb-dot"></div>
+        <span id="backend-status">Connected</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ── MAIN AREA ── -->
+  <main class="main-area">
+
+    <!-- Top Bar -->
+    <header class="topbar">
+      <button class="icon-btn" id="menu-toggle" style="display:none">
+        <i class="fa-solid fa-bars"></i>
+      </button>
+      <div class="topbar-left">
+        <h2 id="tab-title">Security Dashboard</h2>
+        <p id="tab-subtitle" style="color:var(--text-secondary)">Real-time statistics & network health overview</p>
+      </div>
+      <div class="topbar-right">
+        <div class="info-pill" id="wan-ip-pill" style="display:none; border-color:rgba(99,102,241,0.3); background:rgba(99,102,241,0.1);">
+          <i class="fa-solid fa-globe" style="color:#818cf8;"></i>
+          <span>WAN: <strong id="wan-ip-value" style="color:var(--text-primary)">Detecting…</strong></span>
+        </div>
+        <div class="info-pill" id="pill-ip">
+          <i class="fa-solid fa-network-wired"></i>
+          <span>IP: <strong id="header-ip" style="color:var(--text-primary)">Detecting…</strong></span>
+        </div>
+        <div class="info-pill" id="pill-subnet">
+          <i class="fa-solid fa-circle-nodes"></i>
+          <span>Subnet: <strong id="header-subnet" style="color:var(--text-primary)">Detecting…</strong></span>
+        </div>
+        <div class="info-pill" id="pill-admin">
+          <i class="fa-solid fa-user-shield" id="admin-icon"></i>
+          <span id="admin-text" style="color:var(--text-primary)">Checking…</span>
+        </div>
+        <button class="icon-btn" id="theme-btn" title="Toggle dark/light mode">
+          <i class="fa-solid fa-sun" id="theme-icon"></i>
+        </button>
+      </div>
+    </header>
+
+    <!-- Tab Content -->
+    <div class="tab-container" id="tab-container">
+
+      <!-- ══════════════════════════════════════════════
+           1. DASHBOARD TAB
+           ══════════════════════════════════════════════ -->
+      <section id="tab-dashboard" class="tab-pane active">
+
+        <!-- Stat Cards -->
+        <div class="stats-grid" id="stats-grid">
+          <div class="stat-card">
+            <div class="stat-icon cyan"><i class="fa-solid fa-satellite-dish"></i></div>
+            <div class="stat-info"><span>Total Scans</span><div class="stat-value" id="stat-scans">—</div></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon indigo"><i class="fa-solid fa-server"></i></div>
+            <div class="stat-info"><span>Total Devices</span><div class="stat-value" id="stat-total-devices">—</div></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon emerald"><i class="fa-solid fa-wifi"></i></div>
+            <div class="stat-info"><span>Online Now</span><div class="stat-value" id="stat-online">—</div></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon slate"><i class="fa-solid fa-power-off"></i></div>
+            <div class="stat-info"><span>Offline</span><div class="stat-value" id="stat-offline">—</div></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon amber"><i class="fa-solid fa-door-open"></i></div>
+            <div class="stat-info"><span>Open Ports</span><div class="stat-value" id="stat-ports">—</div></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon violet"><i class="fa-solid fa-building"></i></div>
+            <div class="stat-info"><span>Unique Vendors</span><div class="stat-value" id="stat-vendors">—</div></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon sky"><i class="fa-solid fa-star-of-life"></i></div>
+            <div class="stat-info"><span>New Last Scan</span><div class="stat-value" id="stat-new">—</div></div>
+          </div>
+          <div class="stat-card" style="cursor:pointer" onclick="switchTab('alerts')">
+            <div class="stat-icon rose"><i class="fa-solid fa-triangle-exclamation"></i></div>
+            <div class="stat-info"><span>Unresolved Alerts</span><div class="stat-value" id="stat-alerts" style="color:#f87171">—</div></div>
+          </div>
+        </div>
+
+        <!-- Topology Diagram (Digital Twin Visualization) -->
+        <div class="card mb-6" id="topology-card" style="display:flex; flex-direction:column; min-height:400px;">
+          <div class="card-header" style="flex-shrink:0;">
+            <div>
+              <div class="card-title">Network Topology Map</div>
+              <div class="card-subtitle" style="color:var(--text-secondary)">Dynamic digital twin of active nodes connected to the gateway</div>
+            </div>
+            <button class="btn btn-ghost btn-sm" id="btn-re-render-topology" title="Refresh Topology"><i class="fa-solid fa-rotate-right"></i> Refresh Map</button>
+          </div>
+          <div class="topology-wrap" style="position:relative; flex:1; width:100%; display:flex; align-items:center; justify-content:center; overflow:hidden;">
+            <svg id="topology-svg" style="position:absolute; inset:0; width:100%; height:100%;"></svg>
+            <div id="no-data-topology" class="empty-state-wrapper">
+              <i class="fa-solid fa-network-wired" style="font-size:24px;color:var(--text-muted); margin-bottom:12px; display:block;"></i>
+              <p style="margin:0;">Run a scan to map local network topology</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Charts Row 1: Gauge + Device Categories + Service Dist -->
+        <div class="charts-grid mb-6">
+
+          <!-- Security Score Gauge -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">Security Score</div>
+                <div class="card-subtitle" style="color:var(--text-secondary)">Weighted score based on vulnerable ports & services</div>
+              </div>
+            </div>
+            <div class="gauge-wrap">
+              <div style="position:relative;width:160px;height:160px;">
+                <svg class="gauge-svg" viewBox="0 0 100 100">
+                  <circle cx="50" cy="50" r="38" stroke-width="8" stroke="var(--border)" fill="none" stroke-linecap="round"/>
+                  <circle id="gauge-circle" cx="50" cy="50" r="38" stroke-width="8" stroke="#06b6d4" fill="none"
+                          stroke-linecap="round" stroke-dasharray="238.76" stroke-dashoffset="238.76"
+                          style="transition:stroke-dashoffset 1s ease, stroke 0.5s ease;" transform="rotate(-90 50 50)"/>
+                </svg>
+                <div class="gauge-center">
+                  <div class="gauge-score" id="gauge-score">—</div>
+                  <div style="font-size:9px;color:var(--text-muted);font-weight:700;text-transform:uppercase;letter-spacing:0.08em">Score</div>
+                </div>
+              </div>
+              <div class="gauge-label-pill" id="gauge-label">No Data</div>
+            </div>
+          </div>
+
+          <!-- Device Types Chart -->
+          <div class="card" style="display:flex; flex-direction:column;">
+            <div class="card-header" style="flex-shrink:0;">
+              <div class="card-title">Device Categories</div>
+            </div>
+            <div class="chart-container" style="flex:1; position:relative; min-height: 240px; display:flex; flex-direction:column; align-items:center; justify-content:center;">
+              <div style="position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;">
+                <div style="position:relative;width:100%;height:180px;flex-shrink:0;">
+                  <canvas id="chart-device-types"></canvas>
+                </div>
+                <div id="device-categories-legend" style="display:flex;flex-wrap:wrap;justify-content:center;gap:6px;margin-top:12px;width:100%;"></div>
+              </div>
+              <div id="no-data-types" class="empty-state-wrapper" style="background:var(--bg-card); z-index:10;">
+                <i class="fa-solid fa-chart-pie" style="font-size:24px;color:var(--text-muted); margin-bottom:12px; display:block;"></i>
+                <p style="margin:0;">Run a scan to populate</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Port Distribution Chart -->
+          <div class="card" style="display:flex; flex-direction:column;">
+            <div class="card-header" style="flex-shrink:0;">
+              <div class="card-title">Common Services</div>
+            </div>
+            <div class="chart-container" style="flex:1; position:relative; min-height: 240px; display:flex; flex-direction:column; align-items:center; justify-content:center;">
+              <canvas id="chart-ports" style="position:absolute; inset:0; width:100%; height:100%;"></canvas>
+              <div id="no-data-ports" class="empty-state-wrapper" style="background:var(--bg-card); z-index:10;">
+                <i class="fa-solid fa-network-wired" style="font-size:24px;color:var(--text-muted); margin-bottom:12px; display:block;"></i>
+                <p style="margin:0;">Run a scan to populate</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Charts Row 2: Risk + Scan Timeline -->
+        <div class="charts-grid-2">
+
+          <!-- Risk Distribution -->
+          <div class="card" style="display:flex; flex-direction:column;">
+            <div class="card-header" style="flex-shrink:0;">
+              <div class="card-title">Risk Profile</div>
+            </div>
+            <div class="chart-container" style="flex:1; position:relative; min-height: 240px; display:flex; flex-direction:column; align-items:center; justify-content:center;">
+              <canvas id="chart-risk" style="position:absolute; inset:0; width:100%; height:100%;"></canvas>
+              <div id="no-data-risk" class="empty-state-wrapper" style="background:var(--bg-card); z-index:10;">
+                <i class="fa-solid fa-shield-halved" style="font-size:24px;color:var(--text-muted); margin-bottom:12px; display:block;"></i>
+                <p style="margin:0;">Run a scan to populate</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Scan Timeline -->
+          <div class="card" style="display:flex; flex-direction:column;">
+            <div class="card-header" style="flex-shrink:0;">
+              <div class="card-title">Device Discovery Trend</div>
+            </div>
+            <div class="chart-container" style="flex:1; position:relative; min-height: 240px; display:flex; flex-direction:column; align-items:center; justify-content:center;">
+              <canvas id="chart-timeline" style="position:absolute; inset:0; width:100%; height:100%;"></canvas>
+              <div id="no-data-timeline" class="empty-state-wrapper" style="background:var(--bg-card); z-index:10;">
+                <i class="fa-solid fa-chart-line" style="font-size:24px;color:var(--text-muted); margin-bottom:12px; display:block;"></i>
+                <p style="margin:0;">Trend appears after multiple scans</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Gateway Router & Network Info Card (moved from Scanner tab) -->
+        <div class="card mb-6" id="router-info-card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Gateway & Network Status</div>
+              <div class="card-subtitle" style="color:var(--text-secondary)">Auto-detected LAN/WAN telemetry and interface information</div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <div id="bandwidth-display" style="font-size:12px;color:var(--text-secondary);display:flex;gap:12px;align-items:center;">
+                <span><i class="fa-solid fa-arrow-down" style="color:#34d399"></i> <strong id="dash-down-speed" style="color:var(--text-primary)">—</strong> Mbps</span>
+                <span><i class="fa-solid fa-arrow-up" style="color:#818cf8"></i> <strong id="dash-up-speed" style="color:var(--text-primary)">—</strong> Mbps</span>
+              </div>
+              <button type="button" class="btn btn-ghost btn-sm" id="btn-refresh-router" title="Refresh network info">
+                <i class="fa-solid fa-rotate-right"></i> Refresh
+              </button>
+            </div>
+          </div>
+
+          <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px; font-size:12px;">
+            <div style="padding:10px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-md);">
+              <span style="color:var(--text-muted); display:block; font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:0.03em;">Gateway Router</span>
+              <strong id="router-model" style="color:var(--text-primary);font-size:13px">Detecting…</strong>
+            </div>
+            <div style="padding:10px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-md);">
+              <span style="color:var(--text-muted); display:block; font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:0.03em;">LAN Gateway IP</span>
+              <strong id="router-lan" class="text-mono" style="color:var(--brand-primary);font-size:13px">—</strong>
+            </div>
+            <div style="padding:10px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-md);">
+              <span style="color:var(--text-muted); display:block; font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:0.03em;">Public WAN IP</span>
+              <strong id="router-wan" class="text-mono" style="color:var(--brand-primary);font-size:13px">—</strong>
+            </div>
+            <div style="padding:10px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-md);">
+              <span style="color:var(--text-muted); display:block; font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:0.03em;">Interface</span>
+              <strong id="router-interface" style="color:var(--text-primary);font-size:13px;font-weight:600">—</strong>
+            </div>
+            <div style="padding:10px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-md);">
+              <span style="color:var(--text-muted); display:block; font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:0.03em;">DNS Server</span>
+              <strong id="router-dns" class="text-mono" style="color:var(--text-primary);font-size:13px;font-weight:600">—</strong>
+            </div>
+            <div style="padding:10px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-md);">
+              <span style="color:var(--text-muted); display:block; font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:0.03em;">Connection Type</span>
+              <strong id="router-os" style="color:var(--text-primary);font-size:13px;font-weight:600">—</strong>
+            </div>
+            <div style="padding:10px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-md);">
+              <span style="color:var(--text-muted); display:block; font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:0.03em;">Firmware / Server</span>
+              <strong id="router-firmware" style="color:var(--text-primary);font-size:13px;font-weight:600">—</strong>
+            </div>
+            <div style="padding:10px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-md);">
+              <span style="color:var(--text-muted); display:block; font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:0.03em;">System Uptime</span>
+              <strong id="router-uptime" style="color:var(--text-primary);font-size:13px;font-weight:600">—</strong>
+            </div>
+          </div>
+
+          <!-- Bandwidth Analytics Row -->
+          <div id="router-analytics-section" style="margin-top:12px; border-top:1px solid var(--border); padding-top:12px; display:none;">
+            <div style="font-size:10.5px; font-weight:700; text-transform:uppercase; color:var(--text-muted); margin-bottom:8px; letter-spacing:0.05em">Real-time Network Analytics</div>
+            <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; font-size:12px; color:var(--text-secondary)">
+              <div style="padding:8px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-md);">
+                <div style="font-size:9px;text-transform:uppercase;color:var(--text-muted);font-weight:700">Download</div>
+                <div style="margin-top:4px;"><i class="fa-solid fa-arrow-down" style="color:#34d399"></i> <strong id="router-down-speed" style="color:var(--text-primary)">—</strong> Mbps</div>
+              </div>
+              <div style="padding:8px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-md);">
+                <div style="font-size:9px;text-transform:uppercase;color:var(--text-muted);font-weight:700">Upload</div>
+                <div style="margin-top:4px;"><i class="fa-solid fa-arrow-up" style="color:#818cf8"></i> <strong id="router-up-speed" style="color:var(--text-primary)">—</strong> Mbps</div>
+              </div>
+              <div style="padding:8px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-md);">
+                <div style="font-size:9px;text-transform:uppercase;color:var(--text-muted);font-weight:700">Active Clients</div>
+                <div style="margin-top:4px;"><i class="fa-solid fa-users" style="color:var(--brand-primary)"></i> <strong id="router-clients" style="color:var(--text-primary)">—</strong></div>
+              </div>
+              <div style="padding:8px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-md);">
+                <div style="font-size:9px;text-transform:uppercase;color:var(--text-muted);font-weight:700">Network Load</div>
+                <div style="margin-top:4px;"><i class="fa-solid fa-gauge-high" style="color:#fbbf24"></i> <strong id="router-load" style="color:var(--text-primary)">—</strong>%</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Empty State Banner (shown when no scans exist) -->
+        <div id="dashboard-empty" class="card mt-4" style="display:none;text-align:center;padding:48px 24px;">
+          <i class="fa-solid fa-satellite-dish radar-pulse" style="font-size:48px;color:var(--brand-primary);display:block;margin-bottom:16px;"></i>
+          <h3 style="font-size:20px;font-weight:800;color:var(--text-primary);margin-bottom:8px;">No Scan Data Yet</h3>
+          <p style="color:var(--text-secondary);margin-bottom:24px;max-width:400px;margin-left:auto;margin-right:auto;">
+            Run your first scan to populate the dashboard with real network intelligence.
+          </p>
+          <button class="btn btn-primary" onclick="switchTab('scanner')">
+            <i class="fa-solid fa-satellite-dish"></i> Launch Network Scanner
+          </button>
+        </div>
+
+      </section>
+
+
+      <!-- ══════════════════════════════════════════════
+           2. DEVICES INVENTORY TAB
+           ══════════════════════════════════════════════ -->
+      <section id="tab-devices" class="tab-pane">
+
+        <!-- Filter Bar -->
+        <div class="filter-bar">
+          <div class="search-wrap">
+            <i class="fa-solid fa-magnifying-glass"></i>
+            <input type="text" class="form-input" id="devices-search" placeholder="Search IP, hostname, MAC, vendor, OS…">
+          </div>
+
+          <!-- Custom Select: Device Type -->
+          <div class="custom-select" id="devices-type-dropdown" style="width:175px">
+            <div class="custom-select-trigger" id="devices-type-trigger">
+              <span id="devices-type-selected-text">All Types</span>
+              <i class="fa-solid fa-chevron-down"></i>
+            </div>
+            <div class="custom-select-options">
+              <div class="custom-option selected" data-value="all">All Types</div>
+              <div class="custom-option" data-value="Router / Gateway">Router / Gateway</div>
+              <div class="custom-option" data-value="Desktop">Desktop</div>
+              <div class="custom-option" data-value="Laptop">Laptop</div>
+              <div class="custom-option" data-value="Server">Server</div>
+              <div class="custom-option" data-value="NAS">NAS / Storage</div>
+              <div class="custom-option" data-value="Smartphone">Smartphone</div>
+              <div class="custom-option" data-value="Tablet">Tablet</div>
+              <div class="custom-option" data-value="Printer">Printer</div>
+              <div class="custom-option" data-value="Smart TV">Smart TV</div>
+              <div class="custom-option" data-value="Streaming Device">Streaming Device</div>
+              <div class="custom-option" data-value="Gaming Console">Gaming Console</div>
+              <div class="custom-option" data-value="IP Camera">IP Camera</div>
+              <div class="custom-option" data-value="IoT Device">IoT Device</div>
+              <div class="custom-option" data-value="Network Infrastructure">Net Infra</div>
+              <div class="custom-option" data-value="Unknown Device">Unknown</div>
+            </div>
+          </div>
+          <input type="hidden" id="devices-type" value="all">
+
+          <!-- Custom Select: Risk Level -->
+          <div class="custom-select" id="devices-risk-dropdown" style="width:175px">
+            <div class="custom-select-trigger" id="devices-risk-trigger">
+              <span id="devices-risk-selected-text">All Risks</span>
+              <i class="fa-solid fa-chevron-down"></i>
+            </div>
+            <div class="custom-select-options">
+              <div class="custom-option selected" data-value="all">All Risks</div>
+              <div class="custom-option" data-value="Low">Low Risk</div>
+              <div class="custom-option" data-value="Medium">Medium Risk</div>
+              <div class="custom-option" data-value="High">High Risk</div>
+            </div>
+          </div>
+          <input type="hidden" id="devices-risk" value="all">
+
+          <!-- Custom Select: Sort -->
+          <div class="custom-select" id="devices-sort-dropdown" style="width:175px">
+            <div class="custom-select-trigger" id="devices-sort-trigger">
+              <span id="devices-sort-selected-text">Score (High → Low)</span>
+              <i class="fa-solid fa-chevron-down"></i>
+            </div>
+            <div class="custom-select-options">
+              <div class="custom-option selected" data-value="score_desc">Score (High → Low)</div>
+              <div class="custom-option" data-value="score_asc">Score (Low → High)</div>
+              <div class="custom-option" data-value="ip_asc">IP (Ascending)</div>
+              <div class="custom-option" data-value="ip_desc">IP (Descending)</div>
+              <div class="custom-option" data-value="seen_desc">Last Seen (Newest)</div>
+              <div class="custom-option" data-value="seen_asc">Last Seen (Oldest)</div>
+            </div>
+          </div>
+          <input type="hidden" id="devices-sort" value="score_desc">
+          <div class="export-group">
+            <span style="font-size:11px;color:var(--text-muted)">Export:</span>
+            <button class="btn btn-ghost btn-sm" id="export-json"><i class="fa-solid fa-file-code" style="color:#06b6d4"></i> JSON</button>
+            <button class="btn btn-ghost btn-sm" id="export-csv"><i class="fa-solid fa-file-csv" style="color:#34d399"></i> CSV</button>
+            <button class="btn btn-ghost btn-sm" id="export-pdf"><i class="fa-solid fa-file-pdf" style="color:#f87171"></i> PDF</button>
+          </div>
+        </div>
+
+        <!-- Devices Bulk Actions Bar -->
+        <div id="devices-actions-bar" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; padding:10px 14px; background:var(--bg-sidebar); border:1px solid var(--border); border-radius:var(--radius-md);">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <input type="checkbox" id="select-all-devices" style="cursor:pointer; width:16px; height:16px;">
+            <span style="font-size:12px; font-weight:600; color:var(--text-secondary)"><span id="selected-devices-count" style="color:var(--brand-primary)">0</span> selected</span>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button class="btn btn-danger btn-sm" id="delete-selected-devices-btn" style="display:none">
+              <i class="fa-solid fa-trash-can"></i> Delete Selected
+            </button>
+            <button class="btn btn-danger btn-sm" id="clear-inventory-btn">
+              <i class="fa-solid fa-radiation"></i> Wipe Inventory
+            </button>
+          </div>
+        </div>
+
+        <!-- Device Cards Grid -->
+        <div class="devices-grid" id="devices-grid">
+          <!-- Populated dynamically -->
+        </div>
+
+        <div id="devices-empty" class="empty-state" style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding: 48px 20px;">
+          <i class="fa-solid fa-laptop-code" style="font-size: 32px; color: var(--text-muted); margin-bottom: 12px; display: block;"></i>
+          <h3 style="font-size:16px; font-weight: 700; color: var(--text-secondary); margin-bottom: 6px;">No Devices Found</h3>
+          <p style="text-align:center; margin:0 auto 16px auto; font-size:13px; color:var(--text-muted);">Run a scan from the Network Scanner tab to discover devices on your network.</p>
+          <button class="btn btn-sm" style="background:var(--brand-primary); color:white; align-items:center; display:inline-flex; gap:6px; margin:0 auto; font-weight:700; border-radius:var(--radius-md);" onclick="switchTab('scanner')">
+            <i class="fa-solid fa-satellite-dish"></i> Open Scanner
+          </button>
+        </div>
+      </section>
+
+
+      <!-- ══════════════════════════════════════════════
+           3. NETWORK SCANNER TAB
+           ══════════════════════════════════════════════ -->
+      <section id="tab-scanner" class="tab-pane">
+        <div class="scanner-grid">
+
+          <!-- Config Panel -->
+          <div style="display:flex; flex-direction:column; gap:16px; height: 100%;">
+            <div class="card" style="flex: 1; display:flex; flex-direction:column;">
+              <div class="card-header">
+                <div>
+                  <div class="card-title">Scan Configuration</div>
+                  <div class="card-subtitle" style="color:var(--text-secondary)">Configure target and scan profile</div>
+                </div>
+              </div>
+
+              <form id="scan-form">
+
+                <!-- Target Input -->
+                <div class="form-group">
+                  <label class="form-label">Target Subnet / IP</label>
+                  <div class="form-input-icon">
+                    <i class="fa-solid fa-crosshairs"></i>
+                    <input type="text" class="form-input" id="scan-target" placeholder="192.168.0.0/24" required>
+                  </div>
+
+                  <!-- Subnet Explanation -->
+                  <div class="subnet-info-box">
+                    <strong style="color:var(--brand-primary)">Target Guide:</strong><br>
+                    <code>192.168.0.1</code> &nbsp;→ Router only (single device)<br>
+                    <code>192.168.0.0/24</code> → Entire local network (all 254 hosts)<br>
+                    <code>10.0.0.0/24</code> &nbsp; → Corporate subnet range
+                  </div>
+
+                  <!-- Router vs Subnet Prompt -->
+                  <div class="subnet-prompt" id="subnet-prompt">
+                    <div class="subnet-prompt-title">
+                      <i class="fa-solid fa-circle-info"></i>
+                      Single IP detected — what do you want to scan?
+                    </div>
+                    <div class="subnet-prompt-btns">
+                      <button type="button" class="btn btn-ghost btn-sm" id="btn-scan-single">
+                        <i class="fa-solid fa-router"></i> This device only
+                      </button>
+                      <button type="button" class="btn btn-amber btn-sm" id="btn-expand-subnet">
+                        <i class="fa-solid fa-expand"></i> Expand to subnet (<span id="suggested-subnet-text"></span>)
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Scan Profile Custom Select -->
+                <div class="form-group">
+                  <label class="form-label">Scan Profile</label>
+                  <div class="custom-select" id="scan-profile-dropdown">
+                    <div class="custom-select-trigger" id="scan-profile-trigger">
+                      <span id="scan-profile-selected-text">🔍 Standard Scan</span>
+                      <i class="fa-solid fa-chevron-down"></i>
+                    </div>
+                    <div class="custom-select-options">
+                      <div class="custom-option" data-value="quick">⚡ Quick Discovery</div>
+                      <div class="custom-option selected" data-value="standard">🔍 Standard Scan</div>
+                      <div class="custom-option" data-value="deep">🔬 Deep Inspection</div>
+                      <div class="custom-option" data-value="inventory">📋 Inventory Refresh</div>
+                      <div class="custom-option" data-value="audit">🛡️ Security Audit</div>
+                    </div>
+                  </div>
+                  <!-- Hidden input to store value -->
+                  <input type="hidden" id="scan-profile" value="standard">
+                  <div class="form-hint" id="profile-hint" style="color:var(--text-secondary)">Scans top 1000 TCP ports using TCP connect method.</div>
+                </div>
+
+
+                <!-- Toggles -->
+                <div style="border-top:1px solid var(--border);padding-top:14px;margin-bottom:18px;">
+                  <div class="toggle-row">
+                    <div class="toggle-label">
+                      <h4>Simulation Mode</h4>
+                      <p style="color:var(--text-secondary)">Use demo data — no real network scanning</p>
+                    </div>
+                    <label class="toggle-switch">
+                      <input type="checkbox" id="scan-simulation" checked>
+                      <span class="toggle-track"></span>
+                      <span class="toggle-thumb"></span>
+                    </label>
+                  </div>
+                </div>
+
+                <button type="submit" class="btn btn-primary btn-full" id="start-scan-btn">
+                  <i class="fa-solid fa-satellite-dish"></i>
+                  <span>Launch Scan</span>
+                </button>
+              </form>
+
+              <!-- Nmap Status Note -->
+              <div id="nmap-status-note" class="subnet-info-box mt-2" style="display:none;background:rgba(16,185,129,0.06);border-color:rgba(16,185,129,0.20)">
+                <i class="fa-solid fa-circle-check" style="color:#34d399"></i>
+                <span id="nmap-status-text"></span>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- Progress & Results Panel -->
+
+          <div style="display:flex;flex-direction:column;gap:16px;">
+
+            <!-- Progress Card -->
+            <div class="card" id="scan-progress-card" style="display:none">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                <div>
+                  <div style="font-size:14px;font-weight:700;color:var(--text-primary)">Scan Engine</div>
+                  <div style="display:flex; gap:12px; align-items:center;">
+                    <div style="font-size:12px;color:var(--text-secondary)" id="scan-state-text">Queued…</div>
+                    <div style="font-size:11px;color:var(--brand-primary);display:none;font-weight:bold;" id="scan-eta-text"><i class="fa-solid fa-clock"></i> Est: ~3 mins</div>
+                  </div>
+                </div>
+                <span style="font-size:22px;font-weight:900;color:var(--brand-primary)" id="scan-pct">0%</span>
+              </div>
+
+              <div class="progress-bar-track">
+                <div class="progress-bar-fill" id="scan-progress-fill" style="width:0%"></div>
+              </div>
+
+              <div class="console-wrap" style="flex:1; display:flex; flex-direction:column; min-height: 250px;">
+                <div class="console-titlebar" style="display:flex; justify-content:space-between; align-items:center;">
+                  <div style="display:flex; gap:8px; align-items:center;">
+                    <div class="console-dots">
+                      <span style="background:#ef4444"></span>
+                      <span style="background:#f59e0b"></span>
+                      <span style="background:#10b981"></span>
+                    </div>
+                    <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">guardnet@audit-daemon</span>
+                  </div>
+                  <button type="button" class="btn btn-ghost" style="padding:2px 6px; font-size:10px; height:auto; color:var(--text-muted);" onclick="document.getElementById('scan-console').innerHTML=''">
+                     <i class="fa-solid fa-eraser"></i> Clear
+                  </button>
+                </div>
+                <div class="console-logs" id="console-logs" style="flex:1; overflow-y:auto; max-height:300px;">
+                  <div class="log-line" style="color:var(--text-muted)">[System] Awaiting instructions…</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Results Card -->
+            <div class="card" id="scan-results-card" style="display:none">
+              <div class="card-header">
+                <div class="card-title">Discovered Hosts</div>
+                <span class="badge badge-online" id="results-count">0 found</span>
+              </div>
+              <div id="scan-results-list" style="display:flex;flex-direction:column;gap:8px;"></div>
+              <button class="btn btn-ghost btn-sm mt-4" onclick="switchTab('devices')" style="width:100%">
+                <i class="fa-solid fa-laptop-code"></i> View Full Inventory
+              </button>
+            </div>
+
+            <!-- Default placeholder -->
+            <div class="card" id="scanner-placeholder">
+              <div class="empty-state" style="padding:40px 20px;">
+                <i class="fa-solid fa-satellite-dish radar-pulse" style="color:var(--brand-primary)"></i>
+                <h3>Ready to Scan</h3>
+                <p>Configure your target and hit Launch Scan.<br>Results appear here in real-time.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Discovery Diagnostics Panel -->
+        <div class="card" id="discovery-diagnostics-card" style="margin-top:16px;">
+          <div class="card-header" style="cursor:pointer" id="diagnostics-toggle">
+            <div>
+              <div class="card-title"><i class="fa-solid fa-stethoscope" style="color:var(--brand-primary);margin-right:8px"></i>Discovery Diagnostics</div>
+              <div class="card-subtitle" style="color:var(--text-secondary)">Adapter, privilege, and capability status for this scan session</div>
+            </div>
+            <i class="fa-solid fa-chevron-down" id="diagnostics-chevron" style="color:var(--text-muted);transition:transform 0.2s"></i>
+          </div>
+          <div id="diagnostics-body" style="display:none;">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;padding-top:8px;" id="diagnostics-grid">
+              <div style="text-align:center;padding:24px;color:var(--text-muted)"><i class="fa-solid fa-circle-notch spin"></i> Loading diagnostics…</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+
+      <!-- ══════════════════════════════════════════════
+           4. THREAT FEED TAB
+           ══════════════════════════════════════════════ -->
+      <section id="tab-alerts" class="tab-pane">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Threat Intelligence Feed</div>
+              <div class="card-subtitle" style="color:var(--text-secondary)">Network anomalies, newly joined nodes, offline alerts, and vulnerabilities</div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <div class="custom-select" id="alerts-filter-dropdown" style="width:120px; font-size:13.5px; font-weight: 600; height:38px;">
+                <div class="custom-select-trigger" id="alerts-filter-trigger" style="padding:10px 14px;">
+                  <span id="alerts-filter-selected-text">Unresolved</span>
+                  <i class="fa-solid fa-chevron-down" style="transition: transform 0.2s ease;"></i>
+                </div>
+                <div class="custom-select-options">
+                  <div class="custom-option selected" data-value="unresolved">Unresolved</div>
+                  <div class="custom-option" data-value="all">All Alerts</div>
+                </div>
+              </div>
+              <input type="hidden" id="alerts-filter" value="unresolved">
+              <button class="btn btn-ghost" id="resolve-all-btn" style="height:38px; padding: 10px 14px;">
+                <i class="fa-solid fa-circle-check"></i> Resolve All
+              </button>
+            </div>
+          </div>
+          <div id="alerts-list" style="display:flex;flex-direction:column;gap:10px;">
+            <div class="empty-state">
+              <i class="fa-solid fa-shield-check" style="color:#34d399"></i>
+              <h3>No Active Threats</h3>
+              <p>Network audit feed is clear.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════════════════
+           5. SCAN HISTORY TAB
+           ══════════════════════════════════════════════ -->
+      <section id="tab-history" class="tab-pane">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">Scan History</div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <button class="btn btn-danger btn-sm" id="delete-selected-btn" style="display:none">
+                <i class="fa-solid fa-trash-can"></i> Delete Selected
+              </button>
+              <button class="btn btn-danger btn-sm" id="clear-all-history-btn">
+                <i class="fa-solid fa-radiation"></i> Wipe History
+              </button>
+              <button class="btn btn-ghost btn-sm" id="refresh-history-btn">
+                <i class="fa-solid fa-rotate-right"></i> Refresh
+              </button>
+            </div>
+          </div>
+          <div style="overflow-x:auto;">
+            <table class="history-table">
+              <thead>
+                <tr>
+                  <th style="width: 40px; text-align: center;"><input type="checkbox" id="select-all-history"></th>
+                  <th>#</th>
+                  <th>Date & Time</th>
+                  <th>Target IP/Subnet</th>
+                  <th>Scan Profile</th>
+                  <th>Devices</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="history-body">
+                <tr><td colspan="8" style="text-align:center;padding:40px;color:var(--text-muted)">No scan records yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════════════════════════════
+           6. SETTINGS TAB
+           ══════════════════════════════════════════════ -->
+      <section id="tab-settings" class="tab-pane">
+        <form id="settings-form">
+          <div class="settings-grid">
+
+            <!-- Network Settings -->
+            <div class="card">
+              <div class="card-header"><div class="card-title">Network Configuration</div></div>
+              <div class="form-group">
+                <label class="form-label">Default Scan Subnet</label>
+                <div class="form-input-icon">
+                  <i class="fa-solid fa-network-wired"></i>
+                  <input type="text" class="form-input" id="settings-subnet" placeholder="192.168.1.0/24">
+                </div>
+                <div class="form-hint" style="color:var(--text-secondary)">Default target subnet used by automated schedule sweeps</div>
+              </div>
+              <div class="form-group mt-3">
+                <label class="form-label">Scan Schedule</label>
+                <div class="custom-select" id="settings-schedule-dropdown">
+                  <div class="custom-select-trigger" id="settings-schedule-trigger">
+                    <span id="settings-schedule-selected-text">Manual Only</span>
+                    <i class="fa-solid fa-chevron-down"></i>
+                  </div>
+                  <div class="custom-select-options">
+                    <div class="custom-option selected" data-value="manual">Manual Only</div>
+                    <div class="custom-option" data-value="hourly">Every Hour</div>
+                    <div class="custom-option" data-value="daily">Daily at Midnight</div>
+                  </div>
+                </div>
+                <input type="hidden" id="settings-schedule" value="manual">
+              </div>
+              <div class="form-group">
+                <label class="form-label">System Admin Alert Email</label>
+                <div class="form-input-icon">
+                  <i class="fa-solid fa-envelope"></i>
+                  <input type="email" class="form-input" id="settings-email" placeholder="admin@company.local">
+                </div>
+              </div>
+            </div>
+
+            <!-- Alert Settings -->
+            <div class="card">
+              <div class="card-header"><div class="card-title">Alert Preferences</div></div>
+              <div style="padding-bottom:8px;">
+                <div class="toggle-row">
+                  <div class="toggle-label">
+                    <h4>Alert on New Device</h4>
+                    <p style="color:var(--text-secondary)">Trigger alert when unknown device joins network</p>
+                  </div>
+                  <label class="toggle-switch">
+                    <input type="checkbox" id="settings-alert-new">
+                    <span class="toggle-track"></span>
+                    <span class="toggle-thumb"></span>
+                  </label>
+                </div>
+                <div class="toggle-row">
+                  <div class="toggle-label">
+                    <h4>Alert on Device Changes</h4>
+                    <p style="color:var(--text-secondary)">IP change, hostname updates, or new services open</p>
+                  </div>
+                  <label class="toggle-switch">
+                    <input type="checkbox" id="settings-alert-change">
+                    <span class="toggle-track"></span>
+                    <span class="toggle-thumb"></span>
+                  </label>
+                </div>
+                <div class="toggle-row">
+                  <div class="toggle-label">
+                    <h4>Default Simulation Mode</h4>
+                    <p style="color:var(--text-secondary)">Use realistic simulated data instead of raw scanning</p>
+                  </div>
+                  <label class="toggle-switch">
+                    <input type="checkbox" id="settings-sim-mode">
+                    <span class="toggle-track"></span>
+                    <span class="toggle-thumb"></span>
+                  </label>
+                </div>
+              </div>
+              <div class="form-group mt-3">
+                  <label class="form-label">Minimum Alert Severity</label>
+                  <div class="custom-select" id="settings-severity-dropdown">
+                    <div class="custom-select-trigger" id="settings-severity-trigger">
+                      <span id="settings-severity-selected-text">Medium</span>
+                      <i class="fa-solid fa-chevron-down"></i>
+                    </div>
+                    <div class="custom-select-options">
+                      <div class="custom-option" data-value="low">Low</div>
+                      <div class="custom-option selected" data-value="medium">Medium</div>
+                      <div class="custom-option" data-value="high">High</div>
+                      <div class="custom-option" data-value="critical">Critical</div>
+                    </div>
+                  </div>
+                  <input type="hidden" id="smtp-min-severity" value="medium">
+                </div>
+            </div>
+
+            <!-- SMTP Mailer Settings (Spans both columns in CSS settings-grid) -->
+            <div class="card" style="grid-column: span 2">
+              <div class="card-header">
+                <div>
+                  <div class="card-title">SMTP Mail Server Configuration</div>
+                  <div class="card-subtitle" style="color:var(--text-secondary)">Setup outbound notification emails (Gmail App Passwords, Local MTA, Relays)</div>
+                </div>
+                <div class="flex-center gap-2">
+                  <span style="font-size:12px;color:var(--text-secondary)">Mailer Enabled:</span>
+                  <label class="toggle-switch">
+                    <input type="checkbox" id="settings-smtp-enabled">
+                    <span class="toggle-track"></span>
+                    <span class="toggle-thumb"></span>
+                  </label>
+                </div>
+              </div>
+              
+              <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;" id="smtp-inputs-container">
+                <div class="form-group">
+                  <label class="form-label">SMTP Server Host</label>
+                  <div class="form-input-icon">
+                    <i class="fa-solid fa-server"></i>
+                    <input type="text" class="form-input" id="settings-smtp-host" placeholder="smtp.gmail.com">
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">SMTP Port</label>
+                  <div class="form-input-icon">
+                    <i class="fa-solid fa-plug"></i>
+                    <input type="text" class="form-input" id="settings-smtp-port" placeholder="587">
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">SMTP Username (Email)</label>
+                  <div class="form-input-icon">
+                    <i class="fa-solid fa-user"></i>
+                    <input type="text" class="form-input" id="settings-smtp-user" placeholder="username@gmail.com">
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">SMTP Password</label>
+                  <div class="form-input-icon">
+                    <i class="fa-solid fa-key"></i>
+                    <input type="password" class="form-input" id="settings-smtp-pass" placeholder="••••••••••••••••">
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Sender Email (From)</label>
+                  <div class="form-input-icon">
+                    <i class="fa-solid fa-paper-plane"></i>
+                    <input type="email" class="form-input" id="settings-smtp-from" placeholder="guardnet-alerts@example.com">
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Connection Security</label>
+                  <select class="form-select" id="settings-smtp-security">
+                    <option value="none">None (Plain text SMTP)</option>
+                    <option value="tls" selected>STARTTLS (Recommended / Gmail 587)</option>
+                    <option value="ssl">SSL/TLS Implicit (Gmail 465)</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Minimum Alert Severity Filter</label>
+                  <select class="form-select" id="settings-smtp-min-severity">
+                    <option value="low">Low (Alert on all log triggers)</option>
+                    <option value="medium" selected>Medium (Alert on config changes & offline states)</option>
+                    <option value="high">High (Alert on critical CVEs & rogues only)</option>
+                  </select>
+                </div>
+                <div class="form-group" style="justify-content: flex-end;">
+                  <button type="button" class="btn btn-amber btn-sm" id="btn-test-smtp" style="align-self: flex-end; margin-bottom: 4px;">
+                    <i class="fa-solid fa-paper-plane"></i> Test SMTP Connection
+                  </button>
+                </div>
+              </div>
+            </div>
+
+          </div>
+
+          <div style="margin-top:16px;display:flex;gap:10px;">
+            <button type="submit" class="btn btn-primary">
+              <i class="fa-solid fa-floppy-disk"></i> Save Settings
+            </button>
+            <button type="button" class="btn btn-ghost" id="reset-settings-btn">
+              <i class="fa-solid fa-rotate-left"></i> Reset Defaults
+            </button>
+          </div>
+        </form>
+      </section>
+
+    </div><!-- /tab-container -->
+  </main>
+</div><!-- /app-shell -->
+
+<!-- ══════════════════════════════════════════════
+     DEVICE DETAIL MODAL
+     ══════════════════════════════════════════════ -->
+<div class="modal-backdrop" id="device-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <div style="display:flex;align-items:center;gap:12px;">
+        <div class="device-icon-wrap" id="modal-icon" style="background:rgba(6,182,212,0.10);border:1px solid rgba(6,182,212,0.20);color:#06b6d4;font-size:20px;">
+          <i class="fa-solid fa-server"></i>
+        </div>
+        <div>
+          <div id="modal-ip" style="font-size:18px;font-weight:800;font-family:var(--font-mono);color:var(--text-primary)">—</div>
+          <div id="modal-hostname" style="font-size:12px;color:var(--text-secondary)">—</div>
+        </div>
+      </div>
+      <button class="icon-btn" id="modal-close"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+
+    <div class="modal-body">
+      <!-- Score Row -->
+      <div style="display:flex;align-items:center;gap:16px;padding:14px;background:var(--bg-input);border-radius:var(--radius-lg);margin-bottom:20px;border:1px solid var(--border)">
+        <div class="score-ring-sm" id="modal-score-ring">
+          <svg viewBox="0 0 44 44">
+            <circle cx="22" cy="22" r="18" stroke-width="4" stroke="var(--border)" fill="none"/>
+            <circle id="modal-gauge" cx="22" cy="22" r="18" stroke-width="4" stroke="#06b6d4" fill="none"
+                    stroke-dasharray="113.1" stroke-dashoffset="113.1"
+                    transform="rotate(-90 22 22)"
+                    style="transition:stroke-dashoffset 0.8s ease,stroke 0.5s ease;"/>
+          </svg>
+          <div class="score-num" id="modal-score">—</div>
+        </div>
+        <div style="flex:1;display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+          <div><div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.07em;">Vendor</div>
+               <div id="modal-vendor" style="font-size:12.5px;font-weight:600;color:var(--text-secondary);margin-top:3px;">—</div></div>
+          <div><div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.07em;">Category</div>
+               <div id="modal-type" style="font-size:12.5px;font-weight:600;color:var(--text-secondary);margin-top:3px;">—</div>
+               <div id="modal-type-confidence" style="display:none; font-size:9.5px; color:var(--brand-primary); font-weight:700; margin-top:2px;"></div></div>
+          <div><div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.07em;">Status</div>
+               <div id="modal-status" style="margin-top:3px;">—</div></div>
+        </div>
+      </div>
+
+      <!-- Details Grid -->
+      <div class="modal-section">
+        <h4><i class="fa-solid fa-microchip" style="color:var(--brand-primary)"></i> Device Details</h4>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+          <div style="padding:10px;background:var(--bg-input);border-radius:var(--radius-md);border:1px solid var(--border)">
+            <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase">MAC Address</div>
+            <div id="modal-mac" style="font-family:var(--font-mono);font-size:12px;color:var(--text-primary);margin-top:4px;">—</div>
+          </div>
+          <div style="padding:10px;background:var(--bg-input);border-radius:var(--radius-md);border:1px solid var(--border)">
+            <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase">Operating System</div>
+            <div id="modal-os" style="font-size:12px;color:var(--text-primary);margin-top:4px; font-weight: 500;">—</div>
+            <div id="modal-os-confidence-container" style="display:none; font-size:10.5px; color:var(--brand-primary); margin-top:2px; font-weight:700;">
+              Confidence: <span id="modal-os-confidence">0%</span>
+            </div>
+          </div>
+          <div style="padding:10px;background:var(--bg-input);border-radius:var(--radius-md);border:1px solid var(--border)">
+            <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase">First Seen</div>
+            <div id="modal-first-seen" style="font-size:12px;color:var(--text-primary);margin-top:4px;">—</div>
+          </div>
+          <div style="padding:10px;background:var(--bg-input);border-radius:var(--radius-md);border:1px solid var(--border)">
+            <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase">Last Seen</div>
+            <div id="modal-last-seen" style="font-size:12px;color:var(--text-primary);margin-top:4px;">—</div>
+          </div>
+        </div>
+        <div style="margin-top:10px;padding:10px;background:var(--bg-input);border-radius:var(--radius-md);border:1px solid var(--border);display:flex;justify-content:space-between;">
+          <span style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase">Scan Appearances</span>
+          <span id="modal-appearances" style="font-size:13px;font-weight:700;color:var(--brand-primary)">—</span>
+        </div>
+      </div>
+
+      <!-- Router View -->
+      <div class="modal-section" id="modal-router-section" style="display:none;">
+        <h4><i class="fa-solid fa-network-wired" style="color:#a78bfa"></i> Router & Gateway Details</h4>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+            <div style="padding:10px;background:var(--bg-input);border-radius:var(--radius-md);border:1px solid var(--border)">
+              <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase">Role</div>
+              <div style="font-size:12px;color:var(--text-primary);margin-top:4px;font-weight:600;">Network Gateway</div>
+            </div>
+            <div style="padding:10px;background:var(--bg-input);border-radius:var(--radius-md);border:1px solid var(--border)">
+              <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase">Access</div>
+              <div style="font-size:12px;color:var(--text-primary);margin-top:4px;">Check ports for Admin UI</div>
+            </div>
+        </div>
+      </div>
+
+      <!-- Open Ports -->
+      <div class="modal-section">
+        <h4><i class="fa-solid fa-door-open" style="color:#fbbf24"></i> Open Ports & Audited Services</h4>
+        <div style="overflow-x:auto;">
+          <table class="port-table">
+            <thead>
+              <tr>
+                <th>Port</th>
+                <th>Proto</th>
+                <th>Service (Banner)</th>
+                <th>Risk</th>
+                <th>Plain English Explanation</th>
+              </tr>
+            </thead>
+            <tbody id="modal-ports">
+              <tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:16px;">No open ports detected</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Alerts for this device -->
+      <div class="modal-section">
+        <h4><i class="fa-solid fa-triangle-exclamation" style="color:#f87171"></i> Device Alerts</h4>
+        <div id="modal-alerts" style="display:flex;flex-direction:column;gap:8px;">
+          <div style="font-size:12px;color:var(--text-muted);text-align:center;padding:12px;">No alerts for this device.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Toast Container -->
+<div id="toast-container"></div>
+
+<!-- ══════════════════════════════════════════════
+     CONFIRMATION DIALOG MODAL (THEMED)
+     ══════════════════════════════════════════════ -->
+<div class="modal-backdrop" id="confirm-modal">
+  <div class="modal" style="max-width: 420px; border-color: rgba(239, 68, 68, 0.35);">
+    <div class="modal-header" style="border-bottom: 1px solid rgba(255, 255, 255, 0.08);">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <i class="fa-solid fa-triangle-exclamation" style="color:#ef4444;font-size:18px;"></i>
+        <h4 id="confirm-title" style="margin:0;font-size:15px;color:var(--text-primary)">Confirm Action</h4>
+      </div>
+      <button class="icon-btn" id="confirm-close"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="modal-body" style="padding-top:16px;">
+      <p id="confirm-message" style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:24px; margin-top:0;">
+        Are you sure you want to proceed? This action cannot be undone.
+      </p>
+      <div style="display:flex;justify-content:flex-end;gap:10px;">
+        <button class="btn btn-ghost btn-sm" id="confirm-cancel-btn">Cancel</button>
+        <button class="btn btn-danger btn-sm" id="confirm-ok-btn">Proceed</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Session Exit Modal -->
+<div id="session-exit-modal" class="session-modal-backdrop" style="display:none;">
+  <div class="session-modal">
+    <div class="session-modal-header">
+      <div style="width:38px;height:38px;border-radius:10px;background:rgba(6,182,212,0.12);border:1px solid rgba(6,182,212,0.25);display:flex;align-items:center;justify-content:center;color:var(--brand-primary);font-size:17px;flex-shrink:0;">
+        <i class="fa-solid fa-shield-halved"></i>
+      </div>
+      <div>
+        <div style="font-size:15px;font-weight:800;color:var(--text-primary);">Close GuardNet?</div>
+        <div style="font-size:12px;color:var(--text-muted);">Choose how to exit this session</div>
+      </div>
+    </div>
+    <div class="session-modal-body">
+      <div class="session-opt" id="sess-save" onclick="sessionExit('save')">
+        <div class="session-opt-icon" style="background:rgba(16,185,129,0.12);color:#34d399;"><i class="fa-solid fa-floppy-disk"></i></div>
+        <div>
+          <h5>Save Session &amp; Exit</h5>
+          <p>Save current scan data and device inventory to disk, then shut down GuardNet cleanly.</p>
+        </div>
+      </div>
+      <div class="session-opt" id="sess-background" onclick="sessionExit('background')">
+        <div class="session-opt-icon" style="background:rgba(99,102,241,0.12);color:#818cf8;"><i class="fa-solid fa-satellite-dish"></i></div>
+        <div>
+          <h5>Keep Scans Running</h5>
+          <p>Detach the browser view. The GuardNet backend continues scanning in the background.</p>
+        </div>
+      </div>
+      <div class="session-opt" id="sess-dismiss" onclick="sessionExit('dismiss')">
+        <div class="session-opt-icon" style="background:rgba(239,68,68,0.12);color:#f87171;"><i class="fa-solid fa-xmark-circle"></i></div>
+        <div>
+          <h5>Dismiss &amp; Close</h5>
+          <p>Wipe current session memory, terminate all active scans, and start fresh on next launch.</p>
+        </div>
+      </div>
+      <button class="btn btn-ghost btn-sm" style="align-self:flex-end;margin-top:4px;" onclick="document.getElementById('session-exit-modal').style.display='none'">
+        Cancel — keep GuardNet open
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- App JS -->
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>
