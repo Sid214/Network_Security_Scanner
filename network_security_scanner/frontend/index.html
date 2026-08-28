@@ -156,23 +156,6 @@
           </div>
         </div>
 
-        <!-- Topology Diagram (Digital Twin Visualization) -->
-        <div class="card mb-6" id="topology-card" style="display:flex; flex-direction:column; min-height:400px;">
-          <div class="card-header" style="flex-shrink:0;">
-            <div>
-              <div class="card-title">Network Topology Map</div>
-              <div class="card-subtitle" style="color:var(--text-secondary)">Dynamic digital twin of active nodes connected to the gateway</div>
-            </div>
-            <button class="btn btn-ghost btn-sm" id="btn-re-render-topology" title="Refresh Topology"><i class="fa-solid fa-rotate-right"></i> Refresh Map</button>
-          </div>
-          <div class="topology-wrap" style="position:relative; flex:1; width:100%; display:flex; align-items:center; justify-content:center; overflow:hidden;">
-            <svg id="topology-svg" style="position:absolute; inset:0; width:100%; height:100%;"></svg>
-            <div id="no-data-topology" class="empty-state-wrapper">
-              <i class="fa-solid fa-network-wired" style="font-size:24px;color:var(--text-muted); margin-bottom:12px; display:block;"></i>
-              <p style="margin:0;">Run a scan to map local network topology</p>
-            </div>
-          </div>
-        </div>
 
         <!-- Charts Row 1: Gauge + Device Categories + Service Dist -->
         <div class="charts-grid mb-6">
@@ -345,6 +328,24 @@
           </div>
         </div>
 
+        <!-- Discovery Diagnostics Panel (moved from Scanner tab to Dashboard) -->
+        <div class="card mb-6" id="dashboard-diagnostics-card">
+          <div class="card-header">
+            <div>
+              <div class="card-title"><i class="fa-solid fa-stethoscope" style="color:var(--brand-primary);margin-right:8px"></i>Discovery Diagnostics</div>
+              <div class="card-subtitle" style="color:var(--text-secondary)">Adapter, privilege, and Nmap capability status for the active scan session</div>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="loadDiagnostics()" title="Refresh diagnostics">
+              <i class="fa-solid fa-rotate-right"></i> Refresh
+            </button>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;padding-top:8px;" id="diagnostics-grid">
+            <div style="text-align:center;padding:24px;color:var(--text-muted);grid-column:span 2">
+              <i class="fa-solid fa-circle-notch spin"></i> Loading diagnostics…
+            </div>
+          </div>
+        </div>
+
         <!-- Empty State Banner (shown when no scans exist) -->
         <div id="dashboard-empty" class="card mt-4" style="display:none;text-align:center;padding:48px 24px;">
           <i class="fa-solid fa-satellite-dish radar-pulse" style="font-size:48px;color:var(--brand-primary);display:block;margin-bottom:16px;"></i>
@@ -352,7 +353,7 @@
           <p style="color:var(--text-secondary);margin-bottom:24px;max-width:400px;margin-left:auto;margin-right:auto;">
             Run your first scan to populate the dashboard with real network intelligence.
           </p>
-          <button class="btn btn-primary" onclick="switchTab('scanner')">
+          <button class="btn btn-primary" onclick="window.switchTab('scanner')">
             <i class="fa-solid fa-satellite-dish"></i> Launch Network Scanner
           </button>
         </div>
@@ -463,7 +464,7 @@
           <i class="fa-solid fa-laptop-code" style="font-size: 32px; color: var(--text-muted); margin-bottom: 12px; display: block;"></i>
           <h3 style="font-size:16px; font-weight: 700; color: var(--text-secondary); margin-bottom: 6px;">No Devices Found</h3>
           <p style="text-align:center; margin:0 auto 16px auto; font-size:13px; color:var(--text-muted);">Run a scan from the Network Scanner tab to discover devices on your network.</p>
-          <button class="btn btn-sm" style="background:var(--brand-primary); color:white; align-items:center; display:inline-flex; gap:6px; margin:0 auto; font-weight:700; border-radius:var(--radius-md);" onclick="switchTab('scanner')">
+          <button class="btn btn-primary" onclick="window.switchTab('scanner')" style="display:inline-flex;align-items:center;gap:6px;margin:0 auto;width:fit-content;">
             <i class="fa-solid fa-satellite-dish"></i> Open Scanner
           </button>
         </div>
@@ -544,23 +545,26 @@
 
 
                 <!-- Toggles -->
-                <div style="border-top:1px solid var(--border);padding-top:14px;margin-bottom:18px;">
-                  <div class="toggle-row">
+                  <!-- Simulation Mode toggle hidden — all scans are live Nmap -->
+                  <div class="toggle-row" style="display:none;">
                     <div class="toggle-label">
                       <h4>Simulation Mode</h4>
                       <p style="color:var(--text-secondary)">Use demo data — no real network scanning</p>
                     </div>
                     <label class="toggle-switch">
-                      <input type="checkbox" id="scan-simulation" checked>
+                      <input type="checkbox" id="scan-simulation">
                       <span class="toggle-track"></span>
                       <span class="toggle-thumb"></span>
                     </label>
                   </div>
-                </div>
 
                 <button type="submit" class="btn btn-primary btn-full" id="start-scan-btn">
                   <i class="fa-solid fa-satellite-dish"></i>
                   <span>Launch Scan</span>
+                </button>
+                <button type="button" class="btn btn-full" id="abort-scan-btn" style="display:none;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#f87171;">
+                  <i class="fa-solid fa-stop-circle"></i>
+                  <span>Abort Scan</span>
                 </button>
               </form>
 
@@ -621,7 +625,7 @@
                 <span class="badge badge-online" id="results-count">0 found</span>
               </div>
               <div id="scan-results-list" style="display:flex;flex-direction:column;gap:8px;"></div>
-              <button class="btn btn-ghost btn-sm mt-4" onclick="switchTab('devices')" style="width:100%">
+              <button class="btn btn-ghost btn-sm mt-4" onclick="switchTab('devices')">
                 <i class="fa-solid fa-laptop-code"></i> View Full Inventory
               </button>
             </div>

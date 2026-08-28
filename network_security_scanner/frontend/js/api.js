@@ -41,10 +41,11 @@ const ApiClient = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ settings })
     }),
-    startScan: (target, scan_type, simulation_mode) => ApiClient._fetch('/api/scan/start', {
+    // simulation_mode parameter removed — all scans are live Nmap
+    startScan: (target, scan_type) => ApiClient._fetch('/api/scan/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target, scan_type, simulation_mode })
+        body: JSON.stringify({ target, scan_type, simulation_mode: false })
     }),
     deleteDevices:    (ids)         => ApiClient._fetch('/api/devices/delete-selected', {
         method: 'POST',
@@ -52,6 +53,7 @@ const ApiClient = {
         body: JSON.stringify({ device_ids: ids })
     }),
     clearAllDevices:  ()            => ApiClient._fetch('/api/devices/clear-all', { method: 'POST' }),
+    abortScan:        (scan_id)     => ApiClient._fetch(`/api/scan/abort?scan_id=${scan_id}`, { method: 'POST' }),
     getScanStatus:    (scan_id)     => ApiClient._fetch(`/api/scan/status?scan_id=${scan_id}`),
     exportData:       (format)      => fetch(`${BASE}/api/export/${format}`),
 };

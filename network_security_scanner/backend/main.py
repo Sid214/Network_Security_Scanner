@@ -32,7 +32,7 @@ except ImportError:
 class ScanRequest(BaseModel):
     target: str = Field(..., json_schema_extra={"example": "192.168.0.0/24"})
     scan_type: str = Field(default="standard", description="quick|standard|deep|inventory|audit")
-    simulation_mode: bool = Field(default=True)
+    simulation_mode: bool = Field(default=False)
 
 class SettingsRequest(BaseModel):
     settings: Dict[str, Any]
@@ -77,8 +77,7 @@ async def run_schedule_worker():
                 if should_run:
                     print(f"[Scheduler] Starting scheduled {schedule} scan for {target}")
                     scan_id = database.create_scan(target=target, scan_type=schedule, status="running")
-                    scanner.start_scan_job(scan_id=scan_id, target=target,
-                                           scan_profile="standard", simulation_mode=sim_mode)
+                    scanner.start_scan_job(scan_id=scan_id, target=target, scan_profile="standard")
         except Exception as e:
             print(f"[Scheduler] Error: {e}")
 
@@ -290,15 +289,20 @@ def start_scan(request: ScanRequest):
     if not target:
         raise HTTPException(status_code=400, detail="Target cannot be empty")
 
-
     scan_id = database.create_scan(target=target, scan_type=request.scan_type)
     scanner.start_scan_job(
         scan_id=scan_id,
         target=target,
         scan_profile=request.scan_type,
-        simulation_mode=request.simulation_mode
     )
     return {"scan_id": scan_id, "status": "running", "message": "Scan initiated."}
+
+@app.post("/api/scan/abort")
+def abort_scan(scan_id: int):
+    killed = scanner.abort_scan(scan_id)
+    if killed:
+        return {"status": "aborted", "message": "Scan aborted."}
+    return {"status": "not_found", "message": "No active scan found with that ID."}
 
 @app.get("/api/scan/status")
 def get_scan_status(scan_id: int):

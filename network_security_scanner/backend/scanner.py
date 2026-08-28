@@ -40,6 +40,10 @@ except ImportError:
 PROGRESS_LOCK = threading.Lock()
 SCAN_PROGRESS: Dict[int, Dict[str, Any]] = {}
 
+# Active Nmap process registry for abort support
+_ACTIVE_PROCESSES: Dict[int, Any] = {}  # scan_id -> asyncio.subprocess.Process
+_ABORT_FLAGS: Dict[int, bool] = {}       # scan_id -> should_abort
+
 # ─── Progress Tracking ───────────────────────────────────────────────────────
 
 def get_progress(scan_id: int) -> Dict[str, Any]:
@@ -57,6 +61,23 @@ def update_progress(scan_id: int, progress: int = None, log_msg: str = None, sta
             SCAN_PROGRESS[scan_id]["logs"].append(f"[{timestamp}] {log_msg}")
         if status is not None:
             SCAN_PROGRESS[scan_id]["status"] = status
+
+def abort_scan(scan_id: int) -> bool:
+    """Signal a running scan to abort. Returns True if a scan was found and killed."""
+    with PROGRESS_LOCK:
+        _ABORT_FLAGS[scan_id] = True
+    proc = _ACTIVE_PROCESSES.get(scan_id)
+    if proc is not None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return True
+    return False
+
+def is_scan_aborted(scan_id: int) -> bool:
+    with PROGRESS_LOCK:
+        return _ABORT_FLAGS.get(scan_id, False)
 
 # ─── Nmap Detection ──────────────────────────────────────────────────────────
 
@@ -440,30 +461,6 @@ def get_gateway_router_details_sync(gateway_ip: str, simulation_mode: bool) -> d
         details["interface_type"] = "Wired (Ethernet)"
         details["connection_type"] = "Wired"
 
-    if simulation_mode:
-        details["vendor"] = "Demo Vendor"
-        details["model"] = "Demo Gateway Router"
-        details["firmware"] = "Simulated"
-        details["os"] = "Embedded Linux (Simulated)"
-        details["uptime"] = "Simulated Session"
-        details["hostname"] = "gateway.local"
-        details["dhcp_range"] = "192.168.0.100 – 192.168.0.254"
-        details["snmp_active"] = False
-        details["upnp_active"] = False
-        details["analytics"] = {
-            "upload_speed": 0.0,
-            "download_speed": 0.0,
-            "active_clients": 0,
-            "network_utilization": 0.0,
-            "connected_devices": 0
-        }
-        try:
-            rx, tx = get_realtime_bandwidth()
-            details["analytics"]["download_speed"] = rx
-            details["analytics"]["upload_speed"] = tx
-        except Exception:
-            pass
-        return details
 
     if not gateway_ip:
         return details
@@ -996,6 +993,19 @@ def parse_nmap_xml(xml_content: str, gateway_ip: str = None) -> List[Dict[str, A
             )
             security_score = calculate_security_score(ports)
 
+            # ── Extract NSE uptime script result from hostscript block ─────────────────
+            uptime_val = None
+            hostscript_elem = host.find('hostscript')
+            if hostscript_elem is not None:
+                for script_el in hostscript_elem.findall('script'):
+                    if script_el.get('id') == 'uptime':
+                        raw_uptime = script_el.get('output', '').strip()
+                        # Strip the trailing date part ("since ...") for a clean value
+                        uptime_val = raw_uptime.split(' (since')[0].strip() or None
+                        break
+            if not uptime_val:
+                uptime_val = 'Unknown / Security Firewalled'
+
             devices.append({
                 'ip_address':    ip_address,
                 'mac_address':   mac_address.upper() if mac_address else None,
@@ -1003,6 +1013,7 @@ def parse_nmap_xml(xml_content: str, gateway_ip: str = None) -> List[Dict[str, A
                 'vendor':        vendor,
                 'os_name':       os_name,
                 'firmware':      firmware,
+                'uptime':        uptime_val,
                 'device_type':   device_type,
                 'classification_confidence': confidence,
                 'status':        'up',
@@ -1013,412 +1024,19 @@ def parse_nmap_xml(xml_content: str, gateway_ip: str = None) -> List[Dict[str, A
         print(f"[Scanner] Error parsing Nmap XML: {e}")
     return devices
 
-# ─── Discovery Diagnostics ─────────────────────────────────────────────────────
 
-def get_discovery_diagnostics() -> Dict[str, Any]:
-    """Return capability status for the Discovery Diagnostics view."""
-    net = detect_local_network_info()
-    nmap_path = get_nmap_path()
-    admin = is_admin()
-
-    npcap_available = False
-    scapy_available = False
-    if platform.system() == "Windows":
-        try:
-            npcap_check = subprocess.run(
-                ["sc", "query", "npcap"],
-                capture_output=True, text=True, timeout=3
-            )
-            npcap_available = "RUNNING" in npcap_check.stdout
-        except Exception:
-            pass
-
-    try:
-        import scapy
-        scapy_available = True
-    except ImportError:
-        pass
-
-    # ARP table entries (currently reachable devices)
-    arp_entries = parse_arp_table()
-    return {
-        "active_adapter":      net.get("adapter") or net.get("interface") or "Unavailable",
-        "adapter_name":        net.get("interface", "Unavailable"),
-        "detected_subnet":     net.get("subnet", "Unavailable"),
-        "local_ip":            net.get("local_ip", "Unavailable"),
-        "gateway":             net.get("gateway", "Unavailable"),
-        "netmask":             net.get("netmask", "Unavailable"),
-        "dns_server":          net.get("dns_server", "Unavailable"),
-        "detection_method":    net.get("detection_method", "unknown"),
-        "is_admin":            admin,
-        "nmap_available":      nmap_path is not None,
-        "nmap_path":           nmap_path or "Not found",
-        "npcap_available":     npcap_available,
-        "scapy_available":     scapy_available,
-        "arp_hosts":           len(arp_entries),
-        "arp_host_list":       [h["ip_address"] for h in arp_entries],
-        "discovery_methods": {
-            "nmap_host_discovery":  nmap_path is not None,
-            "arp_table":            True,
-            "npcap_passive":        npcap_available,
-            "icmp_ping":            admin,
-        },
-        "limitations": [
-            "Wi-Fi client isolation may prevent peer device visibility",
-            "Guest network isolation separates guest devices",
-            "Privacy-hardened devices may not respond to discovery",
-            "Sleeping/idle devices may not respond to ping",
-            "Firewall rules on devices can block scan responses",
-        ]
-    }
-
-# ─── Simulation Mode ──────────────────────────────────────────────────────────
-
-def _get_sim_base_ip() -> str:
-    try:
-        net = detect_local_network_info()
-        subnet = net.get("subnet", "192.168.0.0/24")
-        base = ".".join(subnet.split(".")[:3])
-        return base
-    except Exception:
-        return "192.168.0"
-
-def _build_mock_library(base_ip: str) -> List[Dict]:
-    return [
-        {
-            "mac_address":  "E4:8D:8C:1A:2B:3C",
-            "ip_address":   f"{base_ip}.1",
-            "hostname":     "gateway.local",
-            "vendor":       "Router Manufacturer",
-            "device_type":  "Router / Gateway",
-            "classification_confidence": "High",
-            "os_name":      "Embedded Linux",
-            "ports": [
-                {"port": 80,  "protocol": "tcp", "service": "http",  "state": "open", "risk_level": "Medium", "description": "HTTP web admin panel"},
-                {"port": 443, "protocol": "tcp", "service": "https", "state": "open", "risk_level": "Low",    "description": "HTTPS secure panel"},
-                {"port": 53,  "protocol": "tcp", "service": "dns",   "state": "open", "risk_level": "Low",    "description": "DNS server"},
-                {"port": 1900,"protocol": "udp", "service": "upnp",  "state": "open", "risk_level": "Low",    "description": "UPnP discovery"},
-            ]
-        },
-        {
-            "mac_address":  "00:22:68:55:A1:B2",
-            "ip_address":   f"{base_ip}.100",
-            "hostname":     "workstation-pc",
-            "vendor":       "Dell Inc.",
-            "device_type":  "Desktop",
-            "classification_confidence": "High",
-            "os_name":      "Windows 11",
-            "ports": [
-                {"port": 135,  "protocol": "tcp", "service": "msrpc",              "state": "open", "risk_level": "Medium", "description": "Windows RPC service"},
-                {"port": 139,  "protocol": "tcp", "service": "netbios-ssn",        "state": "open", "risk_level": "High",   "description": "NetBIOS file sharing"},
-                {"port": 445,  "protocol": "tcp", "service": "microsoft-ds (SMB)", "state": "open", "risk_level": "High",   "description": "SMB file sharing port"},
-                {"port": 3389, "protocol": "tcp", "service": "ms-wbt-server (RDP)","state": "open", "risk_level": "Medium", "description": "Remote Desktop Protocol"},
-            ]
-        },
-        {
-            "mac_address":  "AC:BC:32:89:FE:D2",
-            "ip_address":   f"{base_ip}.105",
-            "hostname":     "macbook-pro",
-            "vendor":       "Apple, Inc.",
-            "device_type":  "Laptop",
-            "classification_confidence": "High",
-            "os_name":      "macOS",
-            "ports": [
-                {"port": 22,  "protocol": "tcp", "service": "ssh (OpenSSH 9.2)",   "state": "open", "risk_level": "Low", "description": "Secure Shell access"},
-                {"port": 443, "protocol": "tcp", "service": "https",                "state": "open", "risk_level": "Low", "description": "HTTPS service"},
-            ]
-        },
-        {
-            "mac_address":  "3C:D9:2B:4E:5F:60",
-            "ip_address":   f"{base_ip}.120",
-            "hostname":     "hp-printer",
-            "vendor":       "Hewlett-Packard",
-            "device_type":  "Printer",
-            "classification_confidence": "High",
-            "os_name":      "HP JetDirect OS",
-            "ports": [
-                {"port": 80,   "protocol": "tcp", "service": "http (HP Management)", "state": "open", "risk_level": "Medium", "description": "Printer web console"},
-                {"port": 515,  "protocol": "tcp", "service": "printer (LPD)",         "state": "open", "risk_level": "Low",    "description": "Line Printer Daemon"},
-                {"port": 9100, "protocol": "tcp", "service": "jetdirect",             "state": "open", "risk_level": "Low",    "description": "JetDirect print port"},
-            ]
-        },
-        {
-            "mac_address":  "B8:81:98:3C:4D:5E",
-            "ip_address":   f"{base_ip}.130",
-            "hostname":     "samsung-tv",
-            "vendor":       "Samsung Electronics",
-            "device_type":  "Smart TV",
-            "classification_confidence": "High",
-            "os_name":      "Tizen OS",
-            "ports": [
-                {"port": 8001, "protocol": "tcp", "service": "smart-tv-remote", "state": "open", "risk_level": "Low",    "description": "Samsung SmartTV API"},
-                {"port": 8080, "protocol": "tcp", "service": "http-proxy",      "state": "open", "risk_level": "Medium", "description": "HTTP proxy service"},
-            ]
-        },
-        {
-            "mac_address":  "B8:27:EB:5C:6D:7E",
-            "ip_address":   f"{base_ip}.200",
-            "hostname":     "raspi-device",
-            "vendor":       "Raspberry Pi Foundation",
-            "device_type":  "IoT Device",
-            "classification_confidence": "Medium",
-            "os_name":      "Raspbian Linux",
-            "ports": [
-                {"port": 22,   "protocol": "tcp", "service": "ssh (OpenSSH 8.4)", "state": "open", "risk_level": "Low",    "description": "SSH remote shell"},
-                {"port": 80,   "protocol": "tcp", "service": "http (nginx)",       "state": "open", "risk_level": "Medium", "description": "Web server"},
-            ]
-        },
-        {
-            "mac_address":  "00:0C:29:A1:B2:C3",
-            "ip_address":   f"{base_ip}.250",
-            "hostname":     "legacy-server",
-            "vendor":       "Dell Inc.",
-            "device_type":  "Server",
-            "classification_confidence": "High",
-            "os_name":      "Ubuntu Linux",
-            "ports": [
-                {"port": 21,  "protocol": "tcp", "service": "ftp (vsftpd)",   "state": "open", "risk_level": "High",   "description": "FTP server — plaintext"},
-                {"port": 23,  "protocol": "tcp", "service": "telnet",          "state": "open", "risk_level": "High",   "description": "Telnet — plaintext"},
-                {"port": 80,  "protocol": "tcp", "service": "http (Apache)",   "state": "open", "risk_level": "Medium", "description": "HTTP web server"},
-                {"port": 22,  "protocol": "tcp", "service": "ssh (OpenSSH 7)", "state": "open", "risk_level": "Low",   "description": "SSH remote access"},
-            ]
-        },
-        {
-            "mac_address":  "A4:C3:F0:11:22:33",
-            "ip_address":   f"{base_ip}.145",
-            "hostname":     "iphone-mobile",
-            "vendor":       "Apple, Inc.",
-            "device_type":  "Smartphone",
-            "classification_confidence": "High",
-            "os_name":      "iOS",
-            "ports": []
-        },
-        {
-            "mac_address":  "DC:A6:32:44:55:66",
-            "ip_address":   f"{base_ip}.210",
-            "hostname":     "nas-storage",
-            "vendor":       "Synology Inc.",
-            "device_type":  "NAS",
-            "classification_confidence": "High",
-            "os_name":      "DiskStation Manager",
-            "ports": [
-                {"port": 22,   "protocol": "tcp", "service": "ssh",            "state": "open", "risk_level": "Low",    "description": "Secure shell access"},
-                {"port": 80,   "protocol": "tcp", "service": "http (DSM UI)",  "state": "open", "risk_level": "Medium", "description": "NAS web interface"},
-                {"port": 443,  "protocol": "tcp", "service": "https (DSM UI)", "state": "open", "risk_level": "Low",    "description": "Secure NAS interface"},
-                {"port": 5000, "protocol": "tcp", "service": "synology-dsm",   "state": "open", "risk_level": "Low",    "description": "Synology DSM service"},
-            ]
-        },
-        {
-            "mac_address":  "70:8B:CD:9E:F0:12",
-            "ip_address":   f"{base_ip}.115",
-            "hostname":     "gaming-console",
-            "vendor":       "Sony Interactive Entertainment",
-            "device_type":  "Gaming Console",
-            "classification_confidence": "High",
-            "os_name":      "FreeBSD",
-            "ports": [
-                {"port": 80,  "protocol": "tcp", "service": "http",  "state": "open", "risk_level": "Medium", "description": "Game service HTTP"},
-                {"port": 443, "protocol": "tcp", "service": "https", "state": "open", "risk_level": "Low",    "description": "Secure game services"},
-            ]
-        },
-    ]
-
-
-def run_simulation(scan_id: int, target: str, scan_profile: str):
-    """Full simulation engine — implements all 5 scan profiles with demo data."""
-    try:
-        update_progress(scan_id, 5, "Scanner engine initialized — Simulation Mode active", "running")
-        time.sleep(0.3)
-        update_progress(scan_id, 10, "Generating demo dataset — no real network scanning", "running")
-        time.sleep(0.3)
-
-        base_ip = _get_sim_base_ip()
-        MOCK_DEVICES = _build_mock_library(base_ip)
-
-        devices_to_insert = []
-        discovered_ips    = []
-
-        # ── Profile: inventory ──────────────────────────────────────────────
-        if scan_profile == "inventory":
-            update_progress(scan_id, 20, "Rechecking known devices in inventory", "running")
-            time.sleep(0.4)
-
-            try:
-                with database.get_db() as db:
-                    existing_devices = db.query(database.Device).all()
-                    device_data = []
-                    for d in existing_devices:
-                        ports_raw = db.query(database.Port).filter(database.Port.device_id == d.id).all()
-                        device_data.append({
-                            "id": d.id,
-                            "mac_address": d.mac_address,
-                            "ip_address":  d.ip_address,
-                            "hostname":    d.hostname,
-                            "vendor":      d.vendor,
-                            "device_type": d.device_type,
-                            "os_name":     d.os_name,
-                            "ports": [{"port": p.port, "protocol": p.protocol, "service": p.service,
-                                       "state": p.state, "risk_level": p.risk_level, "description": p.description}
-                                      for p in ports_raw]
-                        })
-            except Exception as e:
-                update_progress(scan_id, 100, f"Inventory read error", "failed")
-                database.update_scan_status(scan_id, "failed", 0)
-                return
-
-            if not device_data:
-                update_progress(scan_id, 100, "No devices in inventory to verify", "completed")
-                database.update_scan_status(scan_id, "completed", 0)
-                return
-
-            for i, d in enumerate(device_data):
-                progress_val = 20 + int((i / max(len(device_data), 1)) * 65)
-                status = "up" if random.random() > 0.10 else "down"
-                update_progress(scan_id, progress_val,
-                    f"Verified {d['ip_address']} — {'Online' if status == 'up' else 'Offline'}", "running")
-                time.sleep(0.15)
-                if status == "up":
-                    discovered_ips.append(d["ip_address"])
-                devices_to_insert.append({**d, "status": status})
-
-        # ── Profile: quick ──────────────────────────────────────────────────
-        elif scan_profile == "quick":
-            update_progress(scan_id, 20, "Host discovery sweep — ping-free multi-probe method", "running")
-            time.sleep(0.5)
-
-            for i, mock in enumerate(MOCK_DEVICES):
-                progress_val = 20 + int((i / len(MOCK_DEVICES)) * 65)
-                update_progress(scan_id, progress_val, f"Discovered {mock['ip_address']} — {mock['device_type']}", "running")
-                time.sleep(0.1)
-                mock_copy = dict(mock)
-                mock_copy["ports"]  = []  # Quick scan: no port data
-                mock_copy["status"] = "up"
-                devices_to_insert.append(mock_copy)
-                discovered_ips.append(mock["ip_address"])
-
-        # ── Profile: deep ───────────────────────────────────────────────────
-        elif scan_profile == "deep":
-            update_progress(scan_id, 15, "Initiating deep service inspection", "running")
-            time.sleep(0.4)
-            update_progress(scan_id, 25, "Enumerating open ports", "running")
-            time.sleep(0.4)
-            update_progress(scan_id, 35, "Service version fingerprinting active", "running")
-            time.sleep(0.4)
-            update_progress(scan_id, 45, "Operating system detection running", "running")
-            time.sleep(0.4)
-
-            for i, mock in enumerate(MOCK_DEVICES):
-                progress_val = 45 + int((i / len(MOCK_DEVICES)) * 40)
-                update_progress(scan_id, progress_val, f"Deep scan → {mock['ip_address']} ({mock['device_type']})", "running")
-                time.sleep(0.1)
-                mock_copy = dict(mock)
-                mock_copy["status"] = "up"
-                devices_to_insert.append(mock_copy)
-                discovered_ips.append(mock["ip_address"])
-
-        # ── Profile: audit ──────────────────────────────────────────────────
-        elif scan_profile == "audit":
-            update_progress(scan_id, 15, "Security audit starting — analyzing services", "running")
-            time.sleep(0.4)
-            update_progress(scan_id, 25, "Scanning for vulnerable services", "running")
-            time.sleep(0.4)
-            update_progress(scan_id, 38, "Running protocol security checks", "running")
-            time.sleep(0.4)
-
-            for i, mock in enumerate(MOCK_DEVICES):
-                progress_val = 38 + int((i / len(MOCK_DEVICES)) * 47)
-                high_risk = [p for p in mock.get("ports", []) if p.get("risk_level") == "High"]
-                if high_risk:
-                    update_progress(scan_id, progress_val,
-                        f"Risk detected on {mock['ip_address']} — {len(high_risk)} vulnerable port(s)", "running")
-                else:
-                    update_progress(scan_id, progress_val, f"Audit {mock['ip_address']} — Clean", "running")
-                time.sleep(0.1)
-                mock_copy = dict(mock)
-                mock_copy["status"] = "up"
-                devices_to_insert.append(mock_copy)
-                discovered_ips.append(mock["ip_address"])
-
-        # ── Profile: standard (default) ─────────────────────────────────────
-        else:
-            update_progress(scan_id, 20, "Discovering active hosts on network", "running")
-            time.sleep(0.4)
-            update_progress(scan_id, 30, "Scanning top 1000 TCP ports on each host", "running")
-            time.sleep(0.4)
-
-            for i, mock in enumerate(MOCK_DEVICES):
-                progress_val = 30 + int((i / len(MOCK_DEVICES)) * 55)
-                port_count = len(mock.get("ports", []))
-                update_progress(scan_id, progress_val,
-                    f"Found {mock['ip_address']} — {mock['device_type']} ({port_count} port(s) open)", "running")
-                time.sleep(0.1)
-                mock_copy = dict(mock)
-                mock_copy["status"] = "up"
-                devices_to_insert.append(mock_copy)
-                discovered_ips.append(mock_copy["ip_address"])
-
-        # ── Finalize ────────────────────────────────────────────────────────
-        update_progress(scan_id, 88, "Building network topology map", "running")
-        time.sleep(0.3)
-        update_progress(scan_id, 93, "Performing risk analysis", "running")
-        time.sleep(0.3)
-
-        for dev in devices_to_insert:
-            try:
-                status = dev.get("status", "up")
-                device_id = database.upsert_device(
-                    scan_id=scan_id,
-                    ip_address=dev["ip_address"],
-                    mac_address=dev.get("mac_address"),
-                    hostname=dev.get("hostname"),
-                    vendor=dev.get("vendor"),
-                    device_type=dev.get("device_type", "Unknown Device"),
-                    os_name=dev.get("os_name"),
-                    status=status,
-                    classification_confidence=dev.get("classification_confidence"),
-                    is_simulation=True
-                )
-                database.update_device_ports_with_diff(device_id, dev.get("ports", []), scan_id)
-                score = calculate_security_score(
-                    [{"port": p["port"], "state": p.get("state", "open")} for p in dev.get("ports", [])]
-                )
-                database.update_device_security_score(device_id, score)
-            except Exception as dev_err:
-                print(f"[Simulation] Error inserting device {dev.get('ip_address')}: {dev_err}")
-                continue
-
-        if scan_profile not in ("quick",):
-            try:
-                database.mark_offline_missing_devices(scan_id, target, discovered_ips)
-            except Exception:
-                pass
-
-        database.update_scan_status(scan_id, "completed", len(discovered_ips))
-        update_progress(scan_id, 100, f"Scan complete — {len(discovered_ips)} demo hosts generated [SIMULATION]", "completed")
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        try:
-            database.update_scan_status(scan_id, "failed", 0)
-        except Exception:
-            pass
-        update_progress(scan_id, 100, "Simulation error occurred", "failed")
-
-# ─── Real Nmap Scan ────────────────────────────────────────────────────────────
+# ─── Real Nmap Scan Engine ────────────────────────────────────────────────────
 
 async def run_nmap_async(scan_id: int, target: str, scan_profile: str):
-    """Run a real Nmap scan as an asyncio coroutine with proper async subprocess."""
+    """Run a live Nmap scan. Requires Nmap to be installed — no simulation fallback."""
     try:
         nmap_path = get_nmap_path()
         if not nmap_path:
-            update_progress(scan_id, 5, "Nmap not found — falling back to Simulation Mode", "running")
-            await asyncio.sleep(0.5)
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, run_simulation, scan_id, target, scan_profile)
+            update_progress(scan_id, 0, "[ERROR] Nmap not found. Install Nmap from https://nmap.org and restart GuardNet.", "failed")
+            database.update_scan_status(scan_id, "failed", 0)
             return
 
-        update_progress(scan_id, 5, "Scanner engine initialized", "running")
+        update_progress(scan_id, 5, "[INFO] Scanner engine initialized. Nmap detected at: " + nmap_path, "running")
         admin = is_admin()
 
         # Detect gateway for classification
@@ -1427,31 +1045,21 @@ async def run_nmap_async(scan_id: int, target: str, scan_profile: str):
 
         # ── Build nmap argument list per profile ────────────────────────────
         if scan_profile == "quick":
-            # Quick Discovery: host detection only, no port scan
-            # Use multiple host-discovery techniques for better coverage
             update_progress(scan_id, 10, "Quick Discovery — multi-probe host detection", "running")
-            if admin:
-                args = [nmap_path,
-                    "-sn",                         # No port scan
-                    "-PS22,80,443,3389",           # TCP SYN ping
-                    "-PU53,67,123",                # UDP ping
-                    "-PE",                         # ICMP echo
-                    "--min-parallelism", "100",
-                    "--max-rtt-timeout", "300ms",
-                    "--stats-every", "3s",
-                    "-oX", "-",
-                    target
-                ]
-            else:
-                args = [nmap_path,
-                    "-sn",
-                    "-Pn",
-                    "-PS22,80,443,3389",
-                    "--min-parallelism", "50",
-                    "--stats-every", "3s",
-                    "-oX", "-",
-                    target
-                ]
+            args = [nmap_path,
+                "-sn",
+                "-R",
+                "-PE",
+                "-PS22,80,443,3389,8080",
+                "-PA80,443",
+                "-PU53,67,123",
+                "--min-parallelism", "100",
+                "--max-rtt-timeout", "300ms",
+                "--host-timeout", "5s",
+                "--stats-every", "3s",
+                "-oX", "-",
+                target
+            ]
 
         elif scan_profile == "inventory":
             # Inventory Refresh: re-check previously discovered devices
@@ -1469,56 +1077,70 @@ async def run_nmap_async(scan_id: int, target: str, scan_profile: str):
 
             args = [nmap_path,
                 "-sn",
-                "-Pn",
+                "-PE",
                 "-PS22,80,443,3389",
                 "--stats-every", "3s",
                 "-oX", "-"
             ] + db_ips
 
         elif scan_profile == "deep":
-            # Deep Inspection: service versions + OS detection
             update_progress(scan_id, 10, "Deep Inspection — service version and OS detection", "running")
+            scan_method = "-sS" if admin else "-sT"
             args = [nmap_path,
-                "-sS",           # SYN scan (requires root)
-                "-Pn",
-                "-sV",           # Version detection
-                "-O",            # OS detection
-                "-F",            # Fast (top 100 ports)
-                "--open",
+                scan_method,
+                "-sV",
+                "-O",
+                "-R",
+                "-PE",
+                "-PS22,80,443,3389,8080",
+                "-PA80,443",
+                "--script=banner,uptime",
+                "-T4",
                 "--version-intensity", "5",
+                "--min-parallelism", "50",
+                "--host-timeout", "60s",
                 "--stats-every", "3s",
                 "-oX", "-",
                 target
             ]
 
         elif scan_profile == "audit":
-            # Security Audit: services + NSE scripts for vulnerability analysis
             update_progress(scan_id, 10, "Security Audit — service analysis and vulnerability checks", "running")
+            scan_method = "-sS" if admin else "-sT"
             args = [nmap_path,
-                "-sS",
-                "-Pn",
+                scan_method,
                 "-sV",
                 "-O",
-                "-F",
-                "--open",
-                "--script=vuln",
+                "-R",
+                "-PE",
+                "-PS22,80,443,3389,8080",
+                "-PA80,443",
+                "--script=banner,vuln",
+                "-T4",
                 "--version-intensity", "5",
+                "--host-timeout", "120s",
                 "--stats-every", "3s",
                 "-oX", "-",
                 target
             ]
 
         else:  # standard
-            # Standard Scan: common TCP ports, host + service discovery
-            update_progress(scan_id, 10, "Standard Scan — top 1000 TCP ports", "running")
+            update_progress(scan_id, 10, "Standard Scan — top 1000 TCP ports with host discovery", "running")
+            scan_method = "-sS" if admin else "-sT"
             args = [nmap_path,
-                "-sS",
-                "-Pn",
+                scan_method,
                 "-sV",
                 "-O",
-                "-F",
-                "--open",
+                "-R",
+                "-PE",
+                "-PS22,80,443,3389,8080",
+                "-PA80,443",
+                "--script=banner",
+                "-T4",
+                "--version-intensity", "5",
                 "--min-parallelism", "50",
+                "--max-rtt-timeout", "500ms",
+                "--host-timeout", "30s",
                 "--stats-every", "3s",
                 "-oX", "-",
                 target
@@ -1533,15 +1155,17 @@ async def run_nmap_async(scan_id: int, target: str, scan_profile: str):
         except Exception:
             arp_hosts = []
 
-        # ── Launch Nmap process ──────────────────────────────────────────────
+        # ── Launch Nmap process ─────────────────────────────────────────────────
         process = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        update_progress(scan_id, 15, "Discovering active hosts", "running")
+        _ACTIVE_PROCESSES[scan_id] = process
+        update_progress(scan_id, 15, "[INFO] Probing subnet masks. Scanning active target services...", "running")
 
-        # Parse Nmap stderr progress lines in real time
+        # Parse Nmap stderr progress lines — emit clean [INFO] phase messages
+        _last_logged_pct = [0]  # Track last logged milestone to cap log volume
         async def read_stderr(stream):
             while True:
                 line_bytes = await stream.readline()
@@ -1555,24 +1179,27 @@ async def run_nmap_async(scan_id: int, target: str, scan_profile: str):
                     pct = float(match.group(1))
                     mapped_pct = int(15 + (pct / 100.0) * 70)
 
-                    if scan_profile == "deep":
-                        if pct > 60:   phase = "Identifying operating systems"
-                        elif pct > 30: phase = "Service version fingerprinting"
-                        else:          phase = "Enumerating open ports"
-                    elif scan_profile == "audit":
-                        if pct > 40:   phase = "Running vulnerability checks"
-                        else:          phase = "Enumerating services"
-                    elif scan_profile == "standard":
-                        if pct > 40:   phase = "Enumerating TCP services"
-                        else:          phase = "Discovering active hosts"
-                    elif scan_profile == "quick":
-                        phase = "Host discovery sweep"
-                    elif scan_profile == "inventory":
-                        phase = "Verifying device status"
-                    else:
-                        phase = "Scanning"
-
-                    update_progress(scan_id, mapped_pct, phase, "running")
+                    # Emit at most one log per 33% milestone to keep console clean
+                    milestone = int(pct // 33)
+                    if milestone > _last_logged_pct[0]:
+                        _last_logged_pct[0] = milestone
+                        if scan_profile == "deep":
+                            if pct > 60:   phase = "[INFO] Identifying operating systems via TCP/IP stack fingerprinting."
+                            elif pct > 30: phase = "[INFO] Service version banners captured. Correlating software signatures."
+                            else:          phase = "[INFO] Enumerating open ports on discovered hosts."
+                        elif scan_profile == "audit":
+                            if pct > 40:   phase = "[INFO] Running vulnerability check scripts against exposed services."
+                            else:          phase = "[INFO] Enumerating active services and software versions."
+                        elif scan_profile == "standard":
+                            if pct > 40:   phase = "[INFO] Scanning active target services. Grabbing service banners."
+                            else:          phase = "[INFO] Discovering active hosts on target subnet."
+                        elif scan_profile == "quick":
+                            phase = "[INFO] Host discovery sweep in progress."
+                        elif scan_profile == "inventory":
+                            phase = "[INFO] Verifying reachability of known inventory devices."
+                        else:
+                            phase = "[INFO] Scanning in progress."
+                        update_progress(scan_id, mapped_pct, phase, "running")
 
         # Buffer stdout chunks
         stdout_chunks = []
@@ -1588,15 +1215,22 @@ async def run_nmap_async(scan_id: int, target: str, scan_profile: str):
 
         await asyncio.gather(stdout_task, stderr_task)
         await process.wait()
+        _ACTIVE_PROCESSES.pop(scan_id, None)
 
         stdout = b"".join(stdout_chunks)
+
+        # ── Check if scan was aborted ─────────────────────────────────────────
+        if is_scan_aborted(scan_id):
+            update_progress(scan_id, 100, "[INFO] Scan aborted by user.", "aborted")
+            database.update_scan_status(scan_id, "failed", 0)
+            return
 
         # ── Handle non-zero return code ──────────────────────────────────────
         if process.returncode != 0 and process.returncode is not None:
             err_msg = stdout.decode('utf-8', errors='ignore').strip()
             if any(x in err_msg.lower() for x in ["root", "permission", "administrator", "requires"]):
                 update_progress(scan_id, 50, "Insufficient privileges — retrying with TCP connect scan", "running")
-                args2 = [nmap_path, "-sT", "-Pn", "-F", "--open", "-oX", "-", target]
+                args2 = [nmap_path, "-sT", "-PE", "-PS22,80,443,3389", "-T4", "-oX", "-", target]
                 process2 = await asyncio.create_subprocess_exec(
                     *args2,
                     stdout=asyncio.subprocess.PIPE,
@@ -1668,7 +1302,7 @@ async def run_nmap_async(scan_id: int, target: str, scan_profile: str):
                         })
                         discovered_ips.append(h['ip_address'])
 
-        update_progress(scan_id, 93, "Performing risk analysis", "running")
+        update_progress(scan_id, 93, "[INFO] Performing risk analysis and security scoring.", "running")
 
         # ── Store results in database ─────────────────────────────────────────
         for dev in devices:
@@ -1701,7 +1335,7 @@ async def run_nmap_async(scan_id: int, target: str, scan_profile: str):
                 pass
 
         database.update_scan_status(scan_id, "completed", len(devices))
-        update_progress(scan_id, 100, f"Scan complete — {len(devices)} hosts discovered", "completed")
+        update_progress(scan_id, 100, f"[INFO] Scan complete. {len(devices)} host(s) discovered and recorded to inventory.", "completed")
 
     except Exception as e:
         import traceback
@@ -1713,33 +1347,19 @@ async def run_nmap_async(scan_id: int, target: str, scan_profile: str):
         update_progress(scan_id, 100, "Scanner encountered an unexpected error", "failed")
 
 
-def start_scan_job(scan_id: int, target: str, scan_profile: str, simulation_mode: bool):
-    """Dispatch a scan job — simulation runs in a thread, real Nmap uses the event loop."""
-    update_progress(scan_id, 0, "Scan job queued", "running")
+def start_scan_job(scan_id: int, target: str, scan_profile: str, simulation_mode: bool = False):
+    """Dispatch a live Nmap scan job."""
+    update_progress(scan_id, 0, "[INFO] Scan job queued. Awaiting Nmap engine initialization.", "running")
 
-    if simulation_mode:
-        t = threading.Thread(
-            target=run_simulation,
-            args=(scan_id, target, scan_profile),
-            daemon=True
+    if _EVENT_LOOP is not None and _EVENT_LOOP.is_running():
+        asyncio.run_coroutine_threadsafe(
+            run_nmap_async(scan_id, target, scan_profile),
+            _EVENT_LOOP
         )
-        t.start()
     else:
-        if _EVENT_LOOP is not None and _EVENT_LOOP.is_running():
-            asyncio.run_coroutine_threadsafe(
-                run_nmap_async(scan_id, target, scan_profile),
-                _EVENT_LOOP
-            )
-        else:
-            def _run_in_thread():
-                asyncio.run(run_nmap_async(scan_id, target, scan_profile))
-            threading.Thread(target=_run_in_thread, daemon=True).start()
-
-# Initialize bandwidth baseline when module loads
-try:
-    init_bandwidth_baseline()
-except Exception:
-    pass
+        def _run_in_thread():
+            asyncio.run(run_nmap_async(scan_id, target, scan_profile))
+        threading.Thread(target=_run_in_thread, daemon=True).start()
 
 
 # ─── Discovery Diagnostics ───────────────────────────────────────────────────

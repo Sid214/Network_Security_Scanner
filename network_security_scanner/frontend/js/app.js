@@ -94,6 +94,7 @@ const btnScanSingle  = $('btn-scan-single');
 const btnExpandSubnet= $('btn-expand-subnet');
 const nmapNote       = $('nmap-status-note');
 const nmapNoteText   = $('nmap-status-text');
+const abortScanBtn   = $('abort-scan-btn');
 
 // Router discovery panel
 const routerModel    = $('router-model');
@@ -241,7 +242,7 @@ const TAB_META = {
     settings:  { title: 'Platform Settings',       subtitle: 'Configure targets, schedules, and alert preferences' },
 };
 
-function switchTab(tabId) {
+window.switchTab = function switchTab(tabId) {
     currentTab = tabId;
 
     document.querySelectorAll('.nav-btn').forEach(btn => {
@@ -312,6 +313,23 @@ async function initAppData() {
         console.error('Init error:', e);
         setOnline(false);
         toast('Cannot connect to GuardNet backend API.', 'error');
+    }
+}
+
+// ─── Simulation Mode Sync ────────────────────────────────────────────────────
+// Reads the saved setting from DB and syncs the scanner-tab toggle so that the
+// hardcoded `checked` HTML attribute never overrides the user's saved preference.
+async function syncSimulationToggle() {
+    try {
+        const s = await ApiClient.getSettings();
+        // simulation_mode is stored as the string "true" or "false" in DB
+        const savedSim = s.simulation_mode === 'true';
+        if (scanSimulation.checked !== savedSim) {
+            scanSimulation.checked = savedSim;
+        }
+    } catch (e) {
+        // Non-critical: leave toggle in its current state if settings can't load
+        console.warn('[SimSync] Could not sync simulation toggle:', e);
     }
 }
 
@@ -394,14 +412,14 @@ async function loadDashboard() {
 
         const hasData = (s.total_scans ?? 0) > 0;
         dashboardEmpty.style.display = hasData ? 'none' : 'block';
-        $('topology-card').style.display = hasData ? 'block' : 'none';
 
         if (hasData) {
             renderDeviceTypesChart(s.device_types    || []);
             renderPortDistChart(s.port_distribution  || []);
             renderRiskChart(s.risk_distribution      || []);
             renderTimelineChart(s.scan_timeline      || []);
-            renderNetworkTopology(devices);
+            // Auto-load diagnostics on dashboard so the panel is always visible
+            loadDiagnostics();
         }
     } catch (e) {
         console.error('Dashboard load error:', e);
@@ -431,208 +449,8 @@ function updateGauge(circleEl, textEl, labelEl, score, circumference) {
     }
 }
 
-// ─── Topology Map Rendering (Digital Twin SVG) ────────────────────────────────
 
-function renderNetworkTopology(devices) {
-    const svg = $('topology-svg');
-    const noData = $('no-data-topology');
-    
-    const onlineDevices = devices.filter(d => d.status === 'up');
-    if (onlineDevices.length === 0) {
-        svg.style.display = 'none';
-        noData.style.display = 'block';
-        return;
-    }
-    
-    svg.style.display = 'block';
-    noData.style.display = 'none';
-    svg.innerHTML = ''; 
-    
-    // Capture width FIRST to avoid temporal dead-zone (TDZ) hoisting bug
-    const rawWidth = svg.getBoundingClientRect().width;
-    const width = (rawWidth > 100 ? rawWidth : (svg.parentElement?.getBoundingClientRect().width || 700)) - 20;
-    const height = 300;
 
-    // Locate gateway router as topology center
-    let routerNode = onlineDevices.find(d => d.device_type === 'Router / Gateway' || d.device_type === 'Router');
-    if (!routerNode) {
-        routerNode = onlineDevices.find(d => d.ip_address.endsWith('.1')) || onlineDevices[0];
-    }
-
-    const otherNodes = onlineDevices.filter(d => d !== routerNode);
-
-    // SVG filters & styles for glow and packet flow animation
-    const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-    defs.innerHTML = `
-        <filter id="topo-glow" x="-20%" y="-20%" width="140%" height="140%">
-            <feGaussianBlur stdDeviation="3" result="blur" />
-            <feComposite in="SourceGraphic" in2="blur" operator="over" />
-        </filter>
-        <style>
-            @keyframes linkFlow {
-                0% { stroke-dashoffset: 0; }
-                100% { stroke-dashoffset: -30; }
-            }
-            .flow-line {
-                stroke-dasharray: 8, 8;
-                animation: linkFlow 1.2s linear infinite;
-            }
-        </style>
-    `;
-    svg.appendChild(defs);
-    
-    const centerX = width / 2;
-    const centerY = height / 2;
-    
-    // Draw links first (underneath nodes)
-    otherNodes.forEach((node, idx) => {
-        const angle = (idx * 2 * Math.PI) / otherNodes.length;
-        const radius = Math.min(width, height) / 3.2;
-        const nodeX = centerX + radius * Math.cos(angle);
-        const nodeY = centerY + radius * Math.sin(angle);
-        
-        const score = node.security_score ?? 100;
-        const color = score >= 80 ? '#34d399' : score >= 60 ? '#fbbf24' : '#f87171';
-        
-        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-        line.setAttribute('x1', centerX);
-        line.setAttribute('y1', centerY);
-        line.setAttribute('x2', nodeX);
-        line.setAttribute('y2', nodeY);
-        line.setAttribute('stroke', color);
-        line.setAttribute('stroke-width', '2');
-        line.setAttribute('opacity', '0.5');
-        line.setAttribute('class', 'flow-line');
-        svg.appendChild(line);
-    });
-    
-    // Draw device node shapes
-    otherNodes.forEach((node, idx) => {
-        const angle = (idx * 2 * Math.PI) / otherNodes.length;
-        const radius = Math.min(width, height) / 3.2;
-        const nodeX = centerX + radius * Math.cos(angle);
-        const nodeY = centerY + radius * Math.sin(angle);
-        
-        const score = node.security_score ?? 100;
-        const color = score >= 80 ? '#34d399' : score >= 60 ? '#fbbf24' : '#f87171';
-        
-        const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-        g.style.cursor = 'pointer';
-        g.onclick = () => openDeviceModal(node.id);
-        
-        const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-        circle.setAttribute('cx', nodeX);
-        circle.setAttribute('cy', nodeY);
-        circle.setAttribute('r', '18');
-        circle.setAttribute('fill', '#0f172a');
-        circle.setAttribute('stroke', color);
-        circle.setAttribute('stroke-width', '2.5');
-        circle.setAttribute('filter', 'url(#topo-glow)');
-        g.appendChild(circle);
-        
-        // Show device type abbreviation — FA unicode unreliable in SVG cross-browser
-        const TOPO_ABBREVS = {
-            'Router': 'GW', 'Desktop': 'PC', 'Laptop': 'NB', 'Server': 'SRV',
-            'Storage Server': 'NAS', 'Smartphone': 'MOB', 'Printer': 'PRN',
-            'Smart TV': 'TV', 'Gaming Console': 'GMS', 'CCTV Camera': 'CAM',
-            'IoT Device': 'IoT', 'Unknown Device': '?'
-        };
-        const abbrev    = TOPO_ABBREVS[node.device_type] || '?';
-        const nodeColor = CATEGORY_COLORS[node.device_type] || '#64748b';
-
-        const iconEl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        iconEl.setAttribute('x', nodeX);
-        iconEl.setAttribute('y', nodeY);
-        iconEl.setAttribute('fill', nodeColor);
-        iconEl.setAttribute('font-family', 'Outfit, system-ui, sans-serif');
-        iconEl.setAttribute('font-weight', '800');
-        iconEl.setAttribute('font-size', '8px');
-        iconEl.setAttribute('text-anchor', 'middle');
-        iconEl.setAttribute('dominant-baseline', 'central');
-        iconEl.textContent = abbrev;
-        g.appendChild(iconEl);
-        
-        // IP Label below circle node
-        const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        label.setAttribute('x', nodeX);
-        label.setAttribute('y', nodeY + 28);
-        label.setAttribute('fill', '#f1f5f9');
-        label.setAttribute('font-size', '8.5px');
-        label.setAttribute('font-weight', '700');
-        label.setAttribute('text-anchor', 'middle');
-        label.setAttribute('font-family', 'SFMono-Regular, monospace');
-        label.textContent = `.${node.ip_address.split('.').pop()}`;
-        g.appendChild(label);
-        
-        // Category/Name label below IP node
-        const name = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        name.setAttribute('x', nodeX);
-        name.setAttribute('y', nodeY + 38);
-        name.setAttribute('fill', '#94a3b8');
-        name.setAttribute('font-size', '8px');
-        name.setAttribute('text-anchor', 'middle');
-        name.textContent = node.hostname ? (node.hostname.substring(0, 10) + '..') : node.device_type;
-        g.appendChild(name);
-        
-        const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-        title.textContent = `${node.ip_address}\n${node.hostname || 'No hostname'}\nCategory: ${node.device_type}\nSecurity Score: ${score}/100`;
-        g.appendChild(title);
-        
-        svg.appendChild(g);
-    });
-    
-    // Draw Gateway center node
-    const routerG = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-    routerG.style.cursor = 'pointer';
-    if (routerNode.id) {
-        routerG.onclick = () => openDeviceModal(routerNode.id);
-    }
-    
-    const rCircle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-    rCircle.setAttribute('cx', centerX);
-    rCircle.setAttribute('cy', centerY);
-    rCircle.setAttribute('r', '26');
-    rCircle.setAttribute('fill', '#070b13');
-    rCircle.setAttribute('stroke', '#818cf8');
-    rCircle.setAttribute('stroke-width', '3');
-    rCircle.setAttribute('filter', 'url(#topo-glow)');
-    routerG.appendChild(rCircle);
-    
-    // Icon inside Router Center node
-    const rIconEl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    rIconEl.setAttribute('x', centerX);
-    rIconEl.setAttribute('y', centerY);
-    rIconEl.setAttribute('fill', '#818cf8');
-    rIconEl.setAttribute('font-family', 'Outfit, system-ui, sans-serif');
-    rIconEl.setAttribute('font-weight', '900');
-    rIconEl.setAttribute('font-size', '10px');
-    rIconEl.setAttribute('text-anchor', 'middle');
-    rIconEl.setAttribute('dominant-baseline', 'central');
-    rIconEl.textContent = 'GW';
-    routerG.appendChild(rIconEl);
-    
-    // Label below Router Center node
-    const rText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    rText.setAttribute('x', centerX);
-    rText.setAttribute('y', centerY + 40);
-    rText.setAttribute('fill', '#818cf8');
-    rText.setAttribute('font-size', '9.5px');
-    rText.setAttribute('font-weight', '700');
-    rText.setAttribute('text-anchor', 'middle');
-    rText.textContent = 'Gateway Router';
-    routerG.appendChild(rText);
-    
-    const rTitle = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-    rTitle.textContent = `Gateway Router\nIP: ${routerNode.ip_address}\nModel: ${routerNode.hostname || 'Generic'}`;
-    routerG.appendChild(rTitle);
-    
-    svg.appendChild(routerG);
-}
-
-$('btn-re-render-topology').addEventListener('click', () => {
-    renderNetworkTopology(dashboardDevices);
-    toast('Topology map refreshed.', 'info');
-});
 
 // ─── Charts Rendering ────────────────────────────────────────────────────────
 function getChartDefaults() {
@@ -1229,117 +1047,29 @@ modalClose.addEventListener('click', closeDeviceModal);
 deviceModal.addEventListener('click', (e) => { if (e.target === deviceModal) closeDeviceModal(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDeviceModal(); });
 
-function viewDeviceDetails(ip) {
-    const dev = window.lastScanData.find(d => d.ip_address === ip);
-    if (!dev) return;
-
-    let portsHtml = '';
-    if (dev.ports && dev.ports.length > 0) {
-        portsHtml = dev.ports.map(p => {
-            const rowClass = p.risk_level.toLowerCase() === 'high' ? 'style="background:rgba(239,68,68,0.05)"' : '';
-            return `<tr ${rowClass}>
-                      <td><span class="badge ${p.risk_level.toLowerCase() === 'high' ? 'badge-high' : p.risk_level.toLowerCase() === 'medium' ? 'badge-medium' : 'badge-low'}">${p.port}</span></td>
-                      <td>${p.protocol.toUpperCase()}</td>
-                      <td>${p.service}</td>
-                      <td>${p.description}</td>
-                    </tr>`;
-        }).join('');
-    } else {
-        portsHtml = '<tr><td colspan="4" style="text-align:center;color:var(--text-muted)">No open ports detected.</td></tr>';
-    }
-
-    const modalHtml = `
-      <div id="device-modal" style="position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;">
-        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-lg);width:100%;max-width:700px;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 25px 50px -12px rgba(0,0,0,0.5);">
-          
-          <div style="padding:20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
-            <div style="display:flex;align-items:center;gap:12px;">
-              <div class="device-icon-wrap ${getIconTheme(dev.device_type)}">
-                <i class="fa-solid ${getDeviceIcon(dev.device_type)}"></i>
-              </div>
-              <div>
-                <h2 style="font-size:18px;margin:0;color:var(--text-primary);font-family:var(--font-mono)">${dev.ip_address}</h2>
-                <div style="font-size:13px;color:var(--text-secondary);margin-top:4px;">${dev.hostname !== 'Unknown' ? dev.hostname : dev.device_type}</div>
-              </div>
-            </div>
-            <button class="btn btn-ghost" onclick="document.getElementById('device-modal').remove()" style="padding:8px;"><i class="fa-solid fa-xmark" style="font-size:20px"></i></button>
-          </div>
-
-          <div style="padding:20px;overflow-y:auto;flex:1;">
-            
-            <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));gap:16px;margin-bottom:24px;">
-              <div style="background:var(--bg-body);padding:16px;border-radius:var(--radius-md);border:1px solid var(--border)">
-                <div style="font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;margin-bottom:4px;">MAC Address</div>
-                <div style="font-family:var(--font-mono);font-size:14px;color:var(--text-primary)">${dev.mac_address || 'Unknown'}</div>
-              </div>
-              <div style="background:var(--bg-body);padding:16px;border-radius:var(--radius-md);border:1px solid var(--border)">
-                <div style="font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;margin-bottom:4px;">Vendor</div>
-                <div style="font-size:14px;color:var(--text-primary)">${dev.vendor || 'Unknown Manufacturer'}</div>
-              </div>
-              <div style="background:var(--bg-body);padding:16px;border-radius:var(--radius-md);border:1px solid var(--border)">
-                <div style="font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;margin-bottom:4px;">Operating System</div>
-                <div style="font-size:14px;color:var(--text-primary)">${dev.os_name || 'Unknown OS'}</div>
-              </div>
-              ${dev.firmware ? `
-              <div style="background:var(--bg-body);padding:16px;border-radius:var(--radius-md);border:1px solid var(--border)">
-                <div style="font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;margin-bottom:4px;">Kernel / Firmware</div>
-                <div style="font-size:14px;color:var(--text-primary)">${dev.firmware}</div>
-              </div>` : ''}
-            </div>
-
-            <h3 style="font-size:14px;margin:0 0 12px 0;color:var(--text-primary);border-bottom:1px solid var(--border);padding-bottom:8px;">Open Ports & Services</h3>
-            <div class="table-container">
-              <table style="width:100%;text-align:left;border-collapse:collapse;font-size:13px;">
-                <thead>
-                  <tr style="border-bottom:1px solid var(--border);color:var(--text-muted)">
-                    <th style="padding:10px;">Port</th>
-                    <th style="padding:10px;">Protocol</th>
-                    <th style="padding:10px;">Service</th>
-                    <th style="padding:10px;">Security Note</th>
-                  </tr>
-                </thead>
-                <tbody>${portsHtml}</tbody>
-              </table>
-            </div>
-            
-          </div>
-        </div>
-      </div>
-    `;
-    document.body.insertAdjacentHTML('beforeend', modalHtml);
-}
-
-function viewScanDetails(scanId) {
-    ApiClient.getScanStatus(scanId).then(s => {
-        let hostsHtml = '';
-        if (s.devices && s.devices.length > 0) {
-            hostsHtml = s.devices.map(d => {
-                return `<tr>
-                          <td>${d.ip_address}</td>
-                          <td>${d.mac_address || '-'}</td>
-                          <td>${d.device_type}</td>
-                          <td><span class="badge ${d.status === 'up' ? 'badge-online' : 'badge-offline'}">${d.status}</span></td>
-                        </tr>`;
-            }).join('');
-        } else {
-            hostsHtml = '<tr><td colspan="4" style="text-align:center;color:var(--text-muted)">No devices found in this scan.</td></tr>';
-        }
+window.viewScanDetails = function viewScanDetails(scanId) {
+    ApiClient.getScanDetails(scanId).then(details => {
+        const devices = details.devices || [];
+        let hostsHtml = devices.length > 0
+            ? devices.map(d => `<tr>
+                <td style="font-family:var(--font-mono);font-size:12px">${d.ip_address}</td>
+                <td style="font-size:11px;color:var(--text-muted)">${d.mac_address || '—'}</td>
+                <td>${d.device_type}</td>
+                <td><span class="badge ${d.status === 'up' ? 'badge-online' : 'badge-offline'}">${d.status === 'up' ? 'Online' : 'Offline'}</span></td>
+              </tr>`).join('')
+            : '<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:16px">No devices found in this scan.</td></tr>';
 
         const modalHtml = `
           <div id="scan-modal" style="position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;">
             <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-lg);width:100%;max-width:700px;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 25px 50px -12px rgba(0,0,0,0.5);">
-              
               <div style="padding:20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
                 <div>
-                  <h2 style="font-size:18px;margin:0;color:var(--text-primary);">Scan Details #${scanId}</h2>
-                  <div style="font-size:13px;color:var(--text-secondary);margin-top:4px;">Status: ${s.status} | Progress: ${s.progress}%</div>
+                  <h2 style="font-size:18px;margin:0;color:var(--text-primary);">Scan #${scanId} — ${devices.length} device(s)</h2>
                 </div>
-                <button class="btn btn-ghost" onclick="document.getElementById('scan-modal').remove()" style="padding:8px;"><i class="fa-solid fa-xmark" style="font-size:20px"></i></button>
+                <button class="icon-btn" onclick="document.getElementById('scan-modal').remove()"><i class="fa-solid fa-xmark"></i></button>
               </div>
-
               <div style="padding:20px;overflow-y:auto;flex:1;">
-                <h3 style="font-size:14px;margin:0 0 12px 0;color:var(--text-primary);border-bottom:1px solid var(--border);padding-bottom:8px;">Discovered Hosts (${s.devices ? s.devices.length : 0})</h3>
-                <div class="table-container">
+                <div style="overflow-x:auto;">
                   <table style="width:100%;text-align:left;border-collapse:collapse;font-size:13px;">
                     <thead>
                       <tr style="border-bottom:1px solid var(--border);color:var(--text-muted)">
@@ -1354,15 +1084,10 @@ function viewScanDetails(scanId) {
                 </div>
               </div>
             </div>
-          </div>
-        `;
+          </div>`;
         document.body.insertAdjacentHTML('beforeend', modalHtml);
-    }).catch(e => toast('Failed to load scan details.', 'error'));
-}
-
-// Global attach for inline onclick
-window.viewDeviceDetails = viewDeviceDetails;
-window.viewScanDetails = viewScanDetails;
+    }).catch(() => toast('Failed to load scan details.', 'error'));
+};
 
 // ─── Alerts ──────────────────────────────────────────────────────────────────
 async function loadAlerts() {
@@ -1625,6 +1350,11 @@ settingsForm.addEventListener('submit', async (e) => {
             smtp_min_severity: smtpMinSeverity.value,
         });
         toast('Settings updated successfully.', 'success');
+        // Immediately sync the scanner-tab simulation toggle so it stays in
+        // agreement with the newly saved preference without needing a tab switch.
+        if (scanSimulation) {
+            scanSimulation.checked = settingsSimMode.checked;
+        }
     } catch (e) {
         toast('Failed to update settings.', 'error');
     }
@@ -1730,6 +1460,25 @@ btnExpandSubnet.addEventListener('click', () => {
     toast(`Subnet scope set to: ${scanTarget.value}`, 'info');
 });
 
+if (abortScanBtn) {
+    abortScanBtn.addEventListener('click', () => {
+        if (!activeScanId) return;
+        const scanId = activeScanId;
+        showConfirm('Abort Scan', 'Are you sure you want to abort the active scan? Partial results will not be saved.', async () => {
+            try {
+                await ApiClient.abortScan(scanId);
+                clearInterval(activeScanTimer);
+                activeScanId = null;
+                activeScanTimer = null;
+                toast('Scan aborted.', 'warning');
+                resetScanUI();
+            } catch (e) {
+                toast('Failed to abort scan.', 'error');
+            }
+        });
+    });
+}
+
 scanForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     if (activeScanId) {
@@ -1750,6 +1499,7 @@ scanForm.addEventListener('submit', async (e) => {
     subnetPrompt.classList.remove('visible');
     startScanBtn.disabled  = true;
     startScanBtn.innerHTML = '<i class="fa-solid fa-circle-notch spin"></i> <span>Scanning…</span>';
+    if (abortScanBtn) abortScanBtn.style.display = 'flex';
 
     scanPlaceholder.style.display  = 'none';
     progressCard.style.display     = 'block';
@@ -1764,30 +1514,9 @@ scanForm.addEventListener('submit', async (e) => {
     if (etaText) etaText.style.display = 'block';
 
     try {
-        const res = await ApiClient.startScan(target, profile, simMode);
+        const res = await ApiClient.startScan(target, profile);
         activeScanId     = res.scan_id;
         activeScanTimer  = setInterval(() => pollScanStatus(activeScanId), 1500);
-        
-        // Sci-fi Logs Injection
-        const scifiPhrases = [
-            "Injecting probe packets...",
-            "Analyzing kernel signatures...",
-            "Bypassing subnet firewalls...",
-            "Extracting firmware heuristics...",
-            "Correlating CVE databases...",
-            "Intercepting ARP broadcasts..."
-        ];
-        window.scifiInterval = setInterval(() => {
-            if (activeScanId) {
-                const phrase = scifiPhrases[Math.floor(Math.random() * scifiPhrases.length)];
-                const div = document.createElement('div');
-                div.className = 'log-line info';
-                div.style.color = 'var(--brand-primary)';
-                div.textContent = `[Module] ${phrase}`;
-                consoleLogs.appendChild(div);
-                consoleLogs.scrollTop = consoleLogs.scrollHeight;
-            }
-        }, 3000);
         
     } catch (e) {
         if (etaText) etaText.style.display = 'none';
@@ -1813,10 +1542,10 @@ async function pollScanStatus(scanId) {
         const pct = s.progress ?? 0;
         scanFill.style.width   = `${pct}%`;
         scanPct.textContent    = `${pct}%`;
-        scanStateText.textContent = s.status === 'completed' ? 'Complete!' : s.status === 'failed' ? 'Failed' : 'Scanning…';
+        scanStateText.textContent = s.status === 'completed' ? 'Complete!' : s.status === 'failed' ? 'Failed' : s.status === 'aborted' ? 'Aborted' : 'Scanning…';
 
         const logs = s.logs || [];
-        const alreadyRendered = consoleLogs.querySelectorAll('.log-line').length;
+        const alreadyRendered = consoleLogs.querySelectorAll('.log-line:not(.scan-running-indicator)').length;
         if (logs.length > alreadyRendered) {
             const newLogs = logs.slice(alreadyRendered);
             newLogs.forEach(log => {
@@ -1824,6 +1553,7 @@ async function pollScanStatus(scanId) {
                 div.className = 'log-line';
                 const lower = log.toLowerCase();
                 if (lower.includes('error') || lower.includes('fail')) div.className += ' error';
+                else if (lower.includes('abort')) div.className += ' warning';
                 else if (lower.includes('warn') || lower.includes('fallback') || lower.includes('offline') || lower.includes('disappeared')) div.className += ' warning';
                 else if (lower.includes('complete') || lower.includes('found') || lower.includes('online') || lower.includes('up')) div.className += ' success';
                 else div.className += ' info';
@@ -1833,7 +1563,22 @@ async function pollScanStatus(scanId) {
             consoleLogs.scrollTop = consoleLogs.scrollHeight;
         }
 
-        if (s.status === 'completed' || s.status === 'failed') {
+        // Professional running indicator — steady dots, no jarring blink
+        let indicator = consoleLogs.querySelector('.scan-running-indicator');
+        if (s.status === 'running') {
+            if (!indicator) {
+                indicator = document.createElement('div');
+                indicator.className = 'log-line info scan-running-indicator';
+                indicator.style.cssText = 'display:flex;align-items:center;gap:8px;opacity:0.75;';
+                indicator.innerHTML = '<i class="fa-solid fa-circle-notch" style="animation:spin 1.2s linear infinite;font-size:11px"></i><span>Scan engine running…</span>';
+            }
+            consoleLogs.appendChild(indicator);
+            consoleLogs.scrollTop = consoleLogs.scrollHeight;
+        } else if (indicator) {
+            indicator.remove();
+        }
+
+        if (s.status === 'completed' || s.status === 'failed' || s.status === 'aborted') {
             clearInterval(activeScanTimer);
             activeScanId   = null;
             activeScanTimer = null;
@@ -1843,6 +1588,8 @@ async function pollScanStatus(scanId) {
                 await showScanResults(scanId);
                 updateAlertsBadge();
                 if (currentTab === 'dashboard') loadDashboard();
+            } else if (s.status === 'aborted') {
+                toast('Scan aborted.', 'warning');
             } else {
                 toast('Network scan failed. Inspect console logs.', 'error');
             }
@@ -1863,16 +1610,47 @@ async function showScanResults(scanId) {
 
         resultsList.innerHTML = devices.map(d => {
             const style = getDeviceStyle(d.device_type);
+            const ports = d.ports || [];
+            // Build a compact ports summary table (max 6 rows for readability)
+            const visiblePorts = ports.slice(0, 6);
+            const portsTable = visiblePorts.length ? `
+              <table style="width:100%;margin-top:8px;border-collapse:collapse;font-size:10.5px;">
+                <thead>
+                  <tr style="color:var(--text-muted);border-bottom:1px solid var(--border);">
+                    <th style="padding:3px 6px;text-align:left;font-weight:600">PORT</th>
+                    <th style="padding:3px 6px;text-align:left;font-weight:600">PROTO</th>
+                    <th style="padding:3px 6px;text-align:left;font-weight:600">SERVICE / BANNER</th>
+                    <th style="padding:3px 6px;text-align:left;font-weight:600">RISK</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${visiblePorts.map(p => `
+                  <tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+                    <td style="padding:3px 6px;font-family:var(--font-mono);color:var(--brand-primary);font-weight:700">${p.port}</td>
+                    <td style="padding:3px 6px;font-family:var(--font-mono);color:var(--text-muted);font-size:10px">${(p.protocol || 'tcp').toUpperCase()}</td>
+                    <td style="padding:3px 6px;color:var(--text-secondary);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.service || ''}">${p.service || '—'}</td>
+                    <td style="padding:3px 6px;"><span class="badge ${p.risk_level === 'High' ? 'badge-high' : p.risk_level === 'Medium' ? 'badge-medium' : 'badge-low'}" style="font-size:9px">${p.risk_level}</span></td>
+                  </tr>`).join('')}
+                  ${ports.length > 6 ? `<tr><td colspan="4" style="padding:4px 6px;color:var(--text-muted);font-size:10px">+${ports.length - 6} more ports — see full inventory</td></tr>` : ''}
+                </tbody>
+              </table>` : `<div style="font-size:10.5px;color:var(--text-muted);margin-top:6px;padding:4px 0">No open ports detected</div>`;
+
             return `
-              <div class="scan-result-item">
-                <div style="width:28px;height:28px;border-radius:6px;background:${style.bg};border:1px solid ${style.border};color:${style.color};display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">
-                  <i class="fa-solid ${style.icon}"></i>
+              <div class="scan-result-item" style="flex-direction:column;align-items:flex-start;gap:6px;">
+                <div style="display:flex;align-items:center;gap:10px;width:100%;">
+                  <div style="width:28px;height:28px;border-radius:6px;background:${style.bg};border:1px solid ${style.border};color:${style.color};display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">
+                    <i class="fa-solid ${style.icon}"></i>
+                  </div>
+                  <div style="flex:1;min-width:0">
+                    <div style="font-family:var(--font-mono);font-size:12.5px;font-weight:700;color:var(--text-primary)">${d.ip_address}</div>
+                    <div style="font-size:11px;color:var(--text-secondary)">${d.hostname || d.device_type} ${d.vendor ? '• ' + d.vendor : ''}</div>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+                    ${d.uptime && d.uptime !== 'Unknown / Security Firewalled' ? `<span style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono)"><i class="fa-solid fa-clock" style="margin-right:3px"></i>${d.uptime}</span>` : ''}
+                    <span class="badge ${d.status === 'up' ? 'badge-online' : 'badge-offline'}">${d.status === 'up' ? 'Up' : 'Down'}</span>
+                  </div>
                 </div>
-                <div style="flex:1;min-width:0">
-                  <div style="font-family:var(--font-mono);font-size:12.5px;font-weight:700;color:var(--text-primary)">${d.ip_address}</div>
-                  <div style="font-size:11px;color:var(--text-secondary)">${d.hostname || d.device_type} ${d.vendor ? '• ' + d.vendor : ''}</div>
-                </div>
-                <span class="badge ${d.status === 'up' ? 'badge-online' : 'badge-offline'}">${d.status === 'up' ? 'Up' : 'Down'}</span>
+                ${portsTable}
               </div>
             `;
         }).join('');
@@ -1882,6 +1660,7 @@ async function showScanResults(scanId) {
 function resetScanUI() {
     startScanBtn.disabled  = false;
     startScanBtn.innerHTML = '<i class="fa-solid fa-satellite-dish"></i><span>Launch Scan</span>';
+    if (abortScanBtn) abortScanBtn.style.display = 'none';
 }
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
@@ -2084,6 +1863,30 @@ function refreshDiagnosticsIfOpen() {
     }
 }
 
+// ─── Session Exit Modal ───────────────────────────────────────────────────────
+function initSessionExit() {
+    let _exitHandled = false;
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden' && !_exitHandled) {
+            const modal = document.getElementById('session-exit-modal');
+            if (modal) modal.style.display = 'flex';
+        }
+    });
+
+    window.addEventListener('beforeunload', (e) => {
+        if (_exitHandled) return;
+        const modal = document.getElementById('session-exit-modal');
+        if (!modal) return;
+        modal.style.display = 'flex';
+        e.preventDefault();
+        e.returnValue = '';
+        return '';
+    });
+
+    window._markExitHandled = () => { _exitHandled = true; };
+}
+
 // Update DEVICE_ICONS to include NAS and IP Camera (from new classifier)
 DEVICE_ICONS['NAS']             = { icon: 'fa-box-archive',      bg: 'rgba(236,72,153,0.12)',  border: 'rgba(236,72,153,0.25)',  color: '#ec4899' };
 DEVICE_ICONS['IP Camera']       = { icon: 'fa-video',            bg: 'rgba(14,116,144,0.12)',  border: 'rgba(14,116,144,0.25)',  color: '#0e7490' };
@@ -2136,22 +1939,11 @@ function startHeartbeat() {
     }, 5000);
 }
 
-// ─── Session Exit Modal ───────────────────────────────────────────────────────
-function initSessionExit() {
-    // beforeunload: show our custom modal instead of browser default
-    window.addEventListener('beforeunload', (e) => {
-        const modal = document.getElementById('session-exit-modal');
-        if (modal) {
-            e.preventDefault();
-            e.returnValue = '';
-            modal.style.display = 'flex';
-            return '';
-        }
-    });
-}
 
 window.sessionExit = async function(action) {
     const modal = document.getElementById('session-exit-modal');
+    if (window._markExitHandled) window._markExitHandled();
+    window.onbeforeunload = null;
     try {
         await fetch('/api/session', {
             method: 'POST',
