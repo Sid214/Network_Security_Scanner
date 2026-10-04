@@ -16,8 +16,7 @@ engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False}
 )
-session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-SessionLocal = scoped_session(session_factory)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 @contextmanager
 def get_db():
@@ -274,6 +273,9 @@ def get_scan_details(scan_id: int) -> dict:
             return None
 
         devices = db.query(Device).filter(Device.scan_id == scan_id).all()
+        # Fallback for historical scans or when devices were refreshed by later scans
+        if not devices and s.device_count > 0:
+            devices = db.query(Device).filter(Device.status == "up").all()
         device_list = []
         for d in devices:
             ports = db.query(Port).filter(Port.device_id == d.id).all()
@@ -356,25 +358,27 @@ def upsert_device(scan_id: int, ip_address: str, mac_address: str = None, hostna
             ).first()
 
         now = datetime.datetime.now()
-        alert_on_new    = get_setting_value("alert_on_new")    == "true"
-        alert_on_change = get_setting_value("alert_on_change") == "true"
+        s_new = db.query(Setting).filter(Setting.key == "alert_on_new").first()
+        alert_on_new = s_new.value == "true" if s_new else True
+        s_chg = db.query(Setting).filter(Setting.key == "alert_on_change").first()
+        alert_on_change = s_chg.value == "true" if s_chg else True
 
         # Determine if MAC is randomized (locally administered MAC)
-        is_randomized = False
-        if mac_address and len(mac_address) >= 2:
-            second_char = mac_address[1].upper()
-            if second_char in ('2', '6', 'A', 'E'):
-                is_randomized = True
+        is_randomized = is_randomized_mac(mac_address)
+        if is_randomized and (not vendor or vendor == "Unknown Manufacturer"):
+            vendor = "Private MAC (Privacy Feature)"
 
         if not device:
             detected_vendor = vendor
-            if mac_address:
+            if mac_address and not is_randomized:
                 prefix = mac_address.upper()[:8]
                 vendor_rec = db.query(Vendor).filter(Vendor.mac_prefix == prefix).first()
                 if vendor_rec:
                     detected_vendor = vendor_rec.name
                 elif not detected_vendor:
                     detected_vendor = "Unknown Manufacturer"
+            elif is_randomized and not detected_vendor:
+                detected_vendor = "Private MAC (Privacy Feature)"
 
             # Insert new device
             device = Device(
@@ -410,10 +414,10 @@ def upsert_device(scan_id: int, ip_address: str, mac_address: str = None, hostna
                 create_alert(db, scan_id, device_id, "new_device", severity,
                              f"New device joined network: {ip_address} ({hostname or 'No Hostname'}) — MAC: {mac_address or 'N/A'}")
 
-            # Rogue device alert for randomized MACs
+            # Notice for randomized/private MACs (privacy feature, not necessarily rogue)
             if is_randomized and device_id is not None:
-                create_alert(db, scan_id, device_id, "rogue_device", "high",
-                             f"Warning: Potential rogue device detected at {ip_address}. Device is using a randomized MAC address ({mac_address}).")
+                create_alert(db, scan_id, device_id, "private_mac", "low",
+                             f"Device at {ip_address} uses a randomized/private MAC address ({mac_address}) for Wi-Fi privacy.")
 
             if detected_vendor == "Unknown Manufacturer" and mac_address and not is_randomized and alert_on_change and device_id is not None:
                 create_alert(db, scan_id, device_id, "unknown_vendor", "low",
@@ -436,8 +440,10 @@ def upsert_device(scan_id: int, ip_address: str, mac_address: str = None, hostna
                 device.os_name = os_name
             if device_type and device_type not in ("Unknown", "Unknown Device"):
                 device.device_type = device_type
-            if vendor and (not device.vendor or device.vendor == "Unknown Manufacturer"):
+            if vendor and (not device.vendor or device.vendor in ("Unknown Manufacturer", "—")):
                 device.vendor = vendor
+            elif is_randomized and (not device.vendor or device.vendor == "Unknown Manufacturer"):
+                device.vendor = "Private MAC (Privacy Feature)"
             if classification_confidence:
                 device.classification_confidence = classification_confidence
             device.status = status
@@ -595,6 +601,12 @@ def update_device_security_score(device_id: int, score: int):
             device.security_score = score
             db.commit()
 
+def is_randomized_mac(mac: str) -> bool:
+    if not mac or len(mac) < 2:
+        return False
+    clean = mac.replace("-", ":").replace(".", "")
+    return len(clean) >= 2 and clean[1].upper() in ('2', '6', 'A', 'E')
+
 def get_devices(search_query: str = None, category_filter: str = None, risk_filter: str = None, sort_by: str = "score_desc") -> list:
     with get_db() as db:
         query = db.query(Device)
@@ -662,6 +674,7 @@ def get_devices(search_query: str = None, category_filter: str = None, risk_filt
                 "appearance_count": d.appearance_count,
                 "security_score": d.security_score,
                 "classification_confidence": d.classification_confidence,
+                "randomized_mac": is_randomized_mac(d.mac_address),
                 "ports": port_list,
                 "max_risk": max_risk
             })
@@ -708,6 +721,7 @@ def get_device_by_id(device_id: int) -> dict:
             "appearance_count": d.appearance_count,
             "security_score": d.security_score,
             "classification_confidence": d.classification_confidence,
+            "randomized_mac": is_randomized_mac(d.mac_address),
             "ports": [
                 {"port": p.port, "protocol": p.protocol, "service": p.service,
                  "state": p.state, "risk_level": p.risk_level, "description": p.description}

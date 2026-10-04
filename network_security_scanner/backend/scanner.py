@@ -1,33 +1,15 @@
 """
-GuardNet Scanner Engine — Network Security Suite
-=================================================
-Implements all 5 scan profiles with real Nmap execution, automatic
-network/adapter discovery from the routing table, and multi-signal
-confidence-based device classification.
-Supports bandwidth analytics, WAN IP detection, and CVE lookup.
+GuardNet Scanner Engine v4.0 - Complete Rewrite
+Uses thread-based subprocess scanning, Scapy ARP sweep, MAC randomization detection.
 """
+import subprocess, shutil, os, re, xml.etree.ElementTree as ET
+import threading, time, socket, platform, json, datetime, ipaddress
+import ctypes, struct
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Any, Optional, Tuple, Union
 
-import subprocess
-import shutil
-import os
-import sys
-import re
-import xml.etree.ElementTree as ET
-import threading
-import asyncio
-import time
-import random
-import socket
-import platform
-import json
-import datetime
-import ipaddress
-from typing import Dict, List, Any, Optional, Tuple
-
-# FastAPI event loop reference — set at startup
-_EVENT_LOOP: asyncio.AbstractEventLoop = None
-
-def set_event_loop(loop: asyncio.AbstractEventLoop):
+_EVENT_LOOP = None
+def set_event_loop(loop):
     global _EVENT_LOOP
     _EVENT_LOOP = loop
 
@@ -36,356 +18,275 @@ try:
 except ImportError:
     import database
 
-# Thread-safe in-memory scan progress tracker
 PROGRESS_LOCK = threading.Lock()
 SCAN_PROGRESS: Dict[int, Dict[str, Any]] = {}
-
-# Active Nmap process registry for abort support
-_ACTIVE_PROCESSES: Dict[int, Any] = {}  # scan_id -> asyncio.subprocess.Process
-_ABORT_FLAGS: Dict[int, bool] = {}       # scan_id -> should_abort
-
-# ─── Progress Tracking ───────────────────────────────────────────────────────
+_ACTIVE_PROCESSES: Dict[int, subprocess.Popen] = {}
+_ABORT_EVENTS: Dict[int, threading.Event] = {}
 
 def get_progress(scan_id: int) -> Dict[str, Any]:
     with PROGRESS_LOCK:
-        return SCAN_PROGRESS.get(scan_id, {"progress": 0, "logs": ["Scan not found"], "status": "failed"})
+        return dict(SCAN_PROGRESS.get(scan_id, {"progress": 0, "logs": ["Scan not found"], "status": "failed"}))
 
-def update_progress(scan_id: int, progress: int = None, log_msg: str = None, status: str = None):
+def _update(scan_id: int, progress: int = None, log: str = None, status: str = None):
     with PROGRESS_LOCK:
         if scan_id not in SCAN_PROGRESS:
             SCAN_PROGRESS[scan_id] = {"progress": 0, "logs": [], "status": "running"}
         if progress is not None:
             SCAN_PROGRESS[scan_id]["progress"] = progress
-        if log_msg is not None:
-            timestamp = time.strftime("%H:%M:%S")
-            SCAN_PROGRESS[scan_id]["logs"].append(f"[{timestamp}] {log_msg}")
+        if log is not None:
+            ts = time.strftime("%H:%M:%S")
+            SCAN_PROGRESS[scan_id]["logs"].append(f"[{ts}] {log}")
         if status is not None:
             SCAN_PROGRESS[scan_id]["status"] = status
 
 def abort_scan(scan_id: int) -> bool:
-    """Signal a running scan to abort. Returns True if a scan was found and killed."""
-    with PROGRESS_LOCK:
-        _ABORT_FLAGS[scan_id] = True
+    event = _ABORT_EVENTS.get(scan_id)
+    if event:
+        event.set()
     proc = _ACTIVE_PROCESSES.get(scan_id)
-    if proc is not None:
+    if proc:
         try:
             proc.kill()
         except Exception:
             pass
         return True
-    return False
+    return bool(event)
 
 def is_scan_aborted(scan_id: int) -> bool:
-    with PROGRESS_LOCK:
-        return _ABORT_FLAGS.get(scan_id, False)
-
-# ─── Nmap Detection ──────────────────────────────────────────────────────────
+    event = _ABORT_EVENTS.get(scan_id)
+    return event.is_set() if event else False
 
 def get_nmap_path() -> Optional[str]:
-    """Find nmap binary — check PATH and common install locations."""
-    root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-    # 1. Check bundled tools directory
-    if platform.system() == "Windows":
-        bundled = os.path.join(root_dir, "tools", "nmap", "nmap.exe")
-    else:
-        bundled = os.path.join(root_dir, "tools", "nmap", "nmap")
-
-    if os.path.isfile(bundled):
-        return bundled
-
-    # 2. Check PATH
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    candidate = os.path.join(root, "tools", "nmap", "nmap.exe" if platform.system() == "Windows" else "nmap")
+    if os.path.isfile(candidate):
+        return candidate
     in_path = shutil.which("nmap")
     if in_path:
         return in_path
-
-    # 3. Common Windows paths
     if platform.system() == "Windows":
-        for p in [
-            r"C:\Program Files (x86)\Nmap\nmap.exe",
-            r"C:\Program Files\Nmap\nmap.exe",
-            r"D:\Program Files\Nmap\nmap.exe",
-            r"D:\Program Files (x86)\Nmap\nmap.exe",
-        ]:
+        for p in [r"C:\Program Files (x86)\Nmap\nmap.exe", r"C:\Program Files\Nmap\nmap.exe",
+                  r"D:\Program Files\Nmap\nmap.exe", r"D:\Program Files (x86)\Nmap\nmap.exe"]:
             if os.path.isfile(p):
                 return p
-
     return None
 
 def is_admin() -> bool:
     return True
 
-# ─── Physical Adapter Detection (routing table based) ────────────────────────
+# --- MAC Randomization Detection ---
+def is_randomized_mac(mac: str) -> bool:
+    """Detect locally-administered (randomized) MACs via the LA bit (bit 1 of first byte)."""
+    if not mac:
+        return False
+    try:
+        first_byte = int(mac.replace(":", "").replace("-", "")[:2], 16)
+        return bool(first_byte & 0x02)
+    except Exception:
+        return False
 
-# Blacklist patterns for virtual / non-physical adapters
+def get_mac_vendor(mac: str) -> Optional[str]:
+    if not mac or is_randomized_mac(mac):
+        return None
+    normalized = mac.upper().replace("-", ":").replace(".", ":")
+    parts = re.split(r"[:\-\.]", normalized)
+    if len(parts) < 3:
+        return None
+    oui = ":".join(parts[:3]).upper()
+    OUI_DB = {
+        "00:00:0C": "Cisco Systems", "00:1A:2B": "Cisco Systems", "5C:50:15": "Cisco Systems",
+        "78:BC:1A": "Cisco Systems", "88:F0:31": "Cisco Systems", "00:0E:38": "Cisco Systems",
+        "00:50:56": "VMware", "00:0C:29": "VMware", "00:15:5D": "Microsoft Hyper-V",
+        "00:03:FF": "Microsoft", "28:18:78": "Microsoft",
+        "B8:27:EB": "Raspberry Pi Foundation", "DC:A6:32": "Raspberry Pi Foundation",
+        "E4:5F:01": "Raspberry Pi Foundation", "2C:CF:67": "Raspberry Pi Foundation",
+        "00:50:B6": "Intel Corporation", "E0:D9:E3": "Intel Corporation",
+        "00:1B:21": "Intel Corporation", "48:45:20": "Intel Corporation",
+        "8C:EC:4B": "Intel Corporation",
+        "A4:C3:F0": "Apple", "AC:BC:32": "Apple", "00:03:93": "Apple",
+        "3C:D9:2B": "Hewlett-Packard", "00:01:30": "Hewlett-Packard",
+        "00:17:A4": "Hewlett-Packard Enterprise", "FC:15:B4": "Hewlett-Packard Enterprise",
+        "3C:4A:92": "Hewlett-Packard", "5C:B9:01": "Hewlett-Packard",
+        "00:01:E6": "Hewlett-Packard", "00:22:64": "Hewlett-Packard",
+        "70:8B:CD": "Sony Interactive Entertainment",
+        "B8:81:98": "Samsung Electronics", "F4:7B:5E": "Samsung Electronics",
+        "00:22:68": "Dell Inc.", "18:03:73": "Dell Inc.",
+        "1C:C1:DE": "Dell Inc.", "14:18:77": "Dell Inc.", "00:11:43": "Dell Inc.",
+        "E4:8D:8C": "Netgear", "20:E5:2A": "Netgear", "00:26:44": "Netgear",
+        "10:0C:6B": "Netgear", "20:4E:7F": "Netgear", "30:46:9A": "Netgear",
+        "4C:60:DE": "Netgear", "6C:B0:CE": "Netgear", "84:1B:5E": "Netgear",
+        "9C:D3:6D": "Netgear", "A0:21:B7": "Netgear", "C0:3F:0E": "Netgear",
+        "50:91:E3": "TP-Link Technologies", "C4:6E:1F": "TP-Link Technologies",
+        "A0:F3:C1": "TP-Link Technologies", "60:E3:27": "TP-Link Technologies",
+        "D4:D2:52": "TP-Link Technologies", "B0:FA:EB": "TP-Link",
+        "7C:8B:CA": "TP-Link", "F8:1A:67": "TP-Link", "A4:2B:B0": "TP-Link",
+        "14:CC:20": "TP-Link", "74:EA:3A": "TP-Link", "B0:BE:76": "TP-Link",
+        "9C:21:6A": "TP-Link", "18:D6:C7": "TP-Link", "98:DE:D0": "TP-Link",
+        "FC:EC:DA": "Ubiquiti Networks", "80:2A:A8": "Ubiquiti Networks",
+        "00:15:6D": "Ubiquiti Networks", "24:A4:3C": "Ubiquiti Networks",
+        "78:8A:20": "Ubiquiti Networks",
+        "00:90:A9": "Western Digital", "00:14:EE": "Western Digital",
+        "94:62:6D": "Xiaomi Communications", "98:F6:21": "Xiaomi Communications",
+        "64:13:6C": "Xiaomi Communications", "AC:C1:EE": "Xiaomi", "7C:7A:91": "Xiaomi",
+        "00:E0:4C": "Realtek Semiconductor", "52:54:00": "QEMU/KVM Virtual",
+        "B4:75:0E": "ASUS", "04:D4:C4": "ASUS", "1C:87:2C": "ASUS",
+        "F8:32:E4": "ASUS", "90:9F:33": "ASUS",
+        "D8:50:E6": "D-Link", "28:10:7B": "D-Link", "74:DA:38": "D-Link",
+        "1C:BD:B9": "D-Link", "00:19:5B": "D-Link",
+        "44:94:FC": "Aruba Networks", "00:0B:86": "Aruba Networks", "24:DE:C6": "Aruba Networks",
+        "A8:9C:ED": "Huawei Technologies", "0C:5B:8F": "Huawei Technologies",
+        "8C:25:05": "Huawei Technologies", "AC:E8:7B": "Huawei Technologies",
+        "CC:96:A0": "Huawei Technologies", "00:E0:FC": "Huawei Technologies",
+        "D4:6E:5C": "Huawei", "B4:86:55": "Huawei", "70:72:CF": "Huawei",
+        "68:7F:74": "Huawei",
+        "90:17:3F": "Synology", "00:11:32": "Synology", "BC:87:FA": "Synology",
+        "00:08:9B": "QNAP Systems", "24:5E:BE": "QNAP Systems",
+        "74:9E:AF": "ARRIS Group",
+        "00:30:6E": "Acer", "E8:40:F2": "Acer", "74:DE:2B": "Acer",
+        "00:13:E8": "Cisco-Linksys", "00:14:BF": "Linksys", "00:25:9C": "Cisco-Linksys",
+        "00:13:10": "Linksys", "00:18:F8": "Linksys", "00:21:29": "Linksys",
+        "00:1C:10": "Linksys", "00:23:69": "Linksys", "00:25:2E": "Linksys",
+        "20:CF:30": "Linksys",
+    }
+    if oui in OUI_DB:
+        return OUI_DB[oui]
+    try:
+        with database.get_db() as db:
+            v = db.query(database.Vendor).filter(database.Vendor.mac_prefix == oui).first()
+            if v:
+                return v.name
+    except Exception:
+        pass
+    return None
+
+# --- Network Detection ---
 _VIRTUAL_ADAPTER_PATTERNS = [
     "vmware", "vmnet", "virtualbox", "vbox", "hyper-v", "hyperv",
     "virtual ethernet", "teredo", "isatap", "6to4", "loopback",
-    "vpn", "nordvpn", "expressvpn", "openvpn", "wireguard", "tunnelblick",
+    "vpn", "nordvpn", "expressvpn", "openvpn", "wireguard",
     "tap-", "tun0", "tun1", "docker", "wsl", "zerotier", "hamachi",
     "microsoft wi-fi direct", "wi-fi direct", "bluetooth",
     "ndis", "miniport", "wan miniport",
 ]
 
 def _is_virtual_adapter(name: str) -> bool:
-    lower = name.lower()
-    return any(p in lower for p in _VIRTUAL_ADAPTER_PATTERNS)
+    return any(p in name.lower() for p in _VIRTUAL_ADAPTER_PATTERNS)
 
 def _get_default_route_interface() -> Optional[Dict[str, str]]:
-    """
-    Parse the Windows IPv4 routing table to find the interface associated
-    with the default gateway (0.0.0.0 network destination).
-    Returns: {interface_ip, gateway, metric}
-    """
     try:
-        out = subprocess.check_output(
-            ["route", "print", "-4"],
-            stderr=subprocess.DEVNULL,
-            timeout=5
-        ).decode("utf-8", errors="ignore")
-
-        best_metric = None
-        best_entry = None
-
+        out = subprocess.check_output(["route", "print", "-4"], stderr=subprocess.DEVNULL, timeout=5).decode("utf-8", errors="ignore")
+        best, best_metric = None, None
         for line in out.splitlines():
-            line = line.strip()
-            # Match default route: 0.0.0.0  0.0.0.0  <gateway>  <interface_ip>  <metric>
-            m = re.match(
-                r"0\.0\.0\.0\s+0\.0\.0\.0\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+)",
-                line
-            )
+            m = re.match(r"0\.0\.0\.0\s+0\.0\.0\.0\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+)", line.strip())
             if m:
-                gateway = m.group(1)
-                iface_ip = m.group(2)
-                metric = int(m.group(3))
-                # Prefer lower metric (= more preferred route)
+                gw, ip, metric = m.group(1), m.group(2), int(m.group(3))
                 if best_metric is None or metric < best_metric:
                     best_metric = metric
-                    best_entry = {"interface_ip": iface_ip, "gateway": gateway, "metric": metric}
-
-        return best_entry
+                    best = {"interface_ip": ip, "gateway": gw, "metric": metric}
+        return best
     except Exception:
         return None
 
 def _get_interface_info_from_psutil(target_ip: str) -> Optional[Dict[str, Any]]:
-    """Given an IP address, find the matching psutil interface and its netmask."""
     try:
         import psutil
-        addrs = psutil.net_if_addrs()
-        stats = psutil.net_if_stats()
-
-        for iface_name, iface_addrs in addrs.items():
+        for iface_name, iface_addrs in psutil.net_if_addrs().items():
             for addr in iface_addrs:
                 if addr.family == socket.AF_INET and addr.address == target_ip:
-                    # Found matching interface
-                    netmask = addr.netmask or "255.255.255.0"
-                    is_up = stats.get(iface_name, None)
-                    is_up = is_up.isup if is_up else True
-                    return {
-                        "name": iface_name,
-                        "ip": target_ip,
-                        "netmask": netmask,
-                        "is_up": is_up
-                    }
+                    stats = psutil.net_if_stats().get(iface_name)
+                    return {"name": iface_name, "ip": target_ip,
+                            "netmask": addr.netmask or "255.255.255.0",
+                            "is_up": stats.isup if stats else True}
     except Exception:
         pass
     return None
 
 def _calculate_subnet_cidr(ip: str, netmask: str) -> str:
-    """Calculate CIDR notation from IP and netmask."""
     try:
-        network = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
-        return str(network)
+        return str(ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False))
     except Exception:
-        # Fallback: use /24
-        octets = ip.split(".")
-        if len(octets) == 4:
-            return f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
-        return "192.168.0.0/24"
+        parts = ip.split(".")
+        return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24" if len(parts) == 4 else "192.168.0.0/24"
 
 def detect_local_network_info() -> Dict[str, Any]:
-    """
-    Detect local IP, gateway, subnet, active network interface, and DNS servers.
-    
-    Uses the routing table default route to identify the correct physical adapter.
-    Will NOT select VMware, VirtualBox, Hyper-V, VPN, or loopback adapters
-    when a real physical Wi-Fi or Ethernet adapter is available.
-    """
-    result = {
-        "local_ip": "127.0.0.1",
-        "gateway": None,
-        "subnet": "192.168.0.0/24",
-        "dns_server": None,
-        "interface": "Unknown Interface",
-        "adapter": "Unavailable",
-        "netmask": "255.255.255.0",
-        "all_subnets": [],
-        "interfaces": [],
-        "detection_method": "fallback"
-    }
-
-    # ── Step 1: Use routing table to find the default-route interface ──────────
-    route_info = _get_default_route_interface()
-    if route_info:
-        iface_ip = route_info["interface_ip"]
-        gateway  = route_info["gateway"]
-        iface_info = _get_interface_info_from_psutil(iface_ip)
-
-        if iface_info:
-            iface_name = iface_info["name"]
-            netmask    = iface_info["netmask"]
-            subnet     = _calculate_subnet_cidr(iface_ip, netmask)
-
-            result["local_ip"]         = iface_ip
-            result["gateway"]          = gateway
-            result["interface"]        = iface_name
-            result["adapter"]          = iface_name
-            result["netmask"]          = netmask
-            result["subnet"]           = subnet
-            result["detection_method"] = "routing_table"
-
+    result = {"local_ip": "127.0.0.1", "gateway": None, "subnet": "192.168.0.0/24",
+              "dns_server": None, "interface": "Unknown", "adapter": "Unknown",
+              "netmask": "255.255.255.0", "all_subnets": [], "detection_method": "fallback"}
+    route = _get_default_route_interface()
+    if route:
+        iface_ip, gw = route["interface_ip"], route["gateway"]
+        info = _get_interface_info_from_psutil(iface_ip)
+        if info:
+            mask = info["netmask"]
+            subnet = _calculate_subnet_cidr(iface_ip, mask)
+            result.update({"local_ip": iface_ip, "gateway": gw, "interface": info["name"],
+                           "adapter": info["name"], "netmask": mask, "subnet": subnet,
+                           "detection_method": "routing_table"})
             if subnet not in result["all_subnets"]:
                 result["all_subnets"].append(subnet)
         else:
-            # psutil didn't find it — construct subnet from routing table IP
-            result["local_ip"] = iface_ip
-            result["gateway"]  = gateway
-            octets = iface_ip.split(".")
-            if len(octets) == 4:
-                subnet = f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
-                result["subnet"] = subnet
-                if subnet not in result["all_subnets"]:
-                    result["all_subnets"].append(subnet)
-            result["detection_method"] = "routing_table_partial"
-
-    # ── Step 2: If routing table gave us nothing, fall back to UDP socket ──────
+            parts = iface_ip.split(".")
+            subnet = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24" if len(parts) == 4 else "192.168.0.0/24"
+            result.update({"local_ip": iface_ip, "gateway": gw, "subnet": subnet,
+                           "detection_method": "routing_table_partial"})
+            if subnet not in result["all_subnets"]:
+                result["all_subnets"].append(subnet)
     if result["local_ip"] == "127.0.0.1":
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.settimeout(1.0)
                 s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-                if local_ip and not local_ip.startswith("127."):
-                    result["local_ip"] = local_ip
-                    octets = local_ip.split(".")
-                    if len(octets) == 4:
-                        subnet = f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
-                        result["subnet"] = subnet
-                        if subnet not in result["all_subnets"]:
-                            result["all_subnets"].append(subnet)
-                    result["detection_method"] = "udp_socket"
+                ip = s.getsockname()[0]
+                if ip and not ip.startswith("127."):
+                    parts = ip.split(".")
+                    subnet = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+                    result.update({"local_ip": ip, "subnet": subnet, "detection_method": "udp_socket"})
+                    if subnet not in result["all_subnets"]:
+                        result["all_subnets"].append(subnet)
         except Exception:
             pass
-
-    # ── Step 3: Get DNS servers from ipconfig /all ─────────────────────────────
     try:
         if platform.system() == "Windows":
-            # Find the DNS for our specific adapter
-            out = subprocess.check_output(
-                ["ipconfig", "/all"],
-                stderr=subprocess.DEVNULL,
-                timeout=5
-            ).decode("utf-8", errors="ignore")
-
-            current_adapter = ""
-            in_target_section = False
-            found_dns = False
-
+            out = subprocess.check_output(["ipconfig", "/all"], stderr=subprocess.DEVNULL, timeout=5).decode("utf-8", errors="ignore")
             for line in out.splitlines():
                 stripped = line.strip()
-
-                # Detect adapter sections (lines ending with ":")
-                if re.match(r'^[A-Za-z].*:$', stripped):
-                    current_adapter = stripped
-                    # Check if this section belongs to our detected interface
-                    iface_name = result["interface"].lower()
-                    in_target_section = (
-                        iface_name in current_adapter.lower() or
-                        iface_name in stripped.lower()
-                    )
-                    continue
-
                 if "dns servers" in stripped.lower():
                     m = re.search(r"(\d+\.\d+\.\d+\.\d+)", stripped)
-                    if m:
-                        dns = m.group(1)
-                        if not dns.startswith("127."):
-                            if in_target_section or not found_dns:
-                                result["dns_server"] = dns
-                                found_dns = True
-
-                # Also capture gateway from ipconfig if we didn't get it from route
+                    if m and not m.group(1).startswith("127."):
+                        result["dns_server"] = m.group(1)
+                        break
                 if not result["gateway"] and "default gateway" in stripped.lower():
                     m = re.search(r"(\d+\.\d+\.\d+\.\d+)", stripped)
-                    if m:
-                        gw = m.group(1)
-                        if not gw.startswith("0."):
-                            result["gateway"] = gw
-        else:
-            # Linux/macOS
-            try:
-                out = subprocess.check_output(
-                    ["ip", "route"],
-                    stderr=subprocess.DEVNULL,
-                    timeout=4
-                ).decode("utf-8")
-                for line in out.splitlines():
-                    if "default via" in line:
-                        parts = line.split()
-                        result["gateway"]   = parts[parts.index("via") + 1]
-                        result["interface"] = parts[parts.index("dev") + 1]
-            except Exception:
-                pass
-
-            if os.path.exists("/etc/resolv.conf"):
-                with open("/etc/resolv.conf", "r") as f:
-                    for line in f:
-                        if line.startswith("nameserver"):
-                            result["dns_server"] = line.split()[1]
-                            break
+                    if m and not m.group(1).startswith("0."):
+                        result["gateway"] = m.group(1)
     except Exception:
         pass
-
     if not result["dns_server"]:
         result["dns_server"] = result.get("gateway") or "8.8.8.8"
-
-    # ── Step 4: Ensure subnet is correctly calculated from local IP + netmask ──
     if result["local_ip"] not in ("127.0.0.1", None) and result.get("netmask"):
         try:
-            correct_subnet = _calculate_subnet_cidr(result["local_ip"], result["netmask"])
-            if correct_subnet != result["subnet"]:
-                result["subnet"] = correct_subnet
-                if correct_subnet not in result["all_subnets"]:
-                    result["all_subnets"].insert(0, correct_subnet)
+            cs = _calculate_subnet_cidr(result["local_ip"], result["netmask"])
+            result["subnet"] = cs
+            if cs not in result["all_subnets"]:
+                result["all_subnets"].insert(0, cs)
         except Exception:
             pass
-
     return result
 
-# ─── WAN IP Detection ──────────────────────────────────────────────────────────
-
 def get_wan_ip() -> Optional[str]:
-    """Fetch external public IP address using public API with timeout."""
     import urllib.request
-    try:
-        req = urllib.request.Request(
-            "https://api.ipify.org?format=json",
-            headers={'User-Agent': 'GuardNet/3.0'}
-        )
-        with urllib.request.urlopen(req, timeout=1.5) as response:
-            data = json.loads(response.read().decode())
-            return data.get("ip")
-    except Exception:
+    for url in ["https://api.ipify.org?format=json", "https://icanhazip.com"]:
         try:
-            with urllib.request.urlopen("https://icanhazip.com", timeout=1.5) as response:
-                return response.read().decode().strip()
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "GuardNet/4.0"}), timeout=2) as r:
+                text = r.read().decode().strip()
+                return json.loads(text).get("ip") if url.endswith("json") else text
         except Exception:
-            return None
+            continue
+    return None
 
 import psutil
 import urllib.request
 
-# Global net traffic trackers
 _LAST_NET_IO = {"rx": 0, "tx": 0, "time": 0.0}
 _BANDWIDTH_LOCK = threading.Lock()
 
@@ -393,8 +294,8 @@ def init_bandwidth_baseline():
     global _LAST_NET_IO
     with _BANDWIDTH_LOCK:
         try:
-            net_io = psutil.net_io_counters()
-            _LAST_NET_IO = {"rx": net_io.bytes_recv, "tx": net_io.bytes_sent, "time": time.time()}
+            io = psutil.net_io_counters()
+            _LAST_NET_IO = {"rx": io.bytes_recv, "tx": io.bytes_sent, "time": time.time()}
         except Exception:
             pass
 
@@ -403,939 +304,789 @@ def get_realtime_bandwidth() -> Tuple[float, float]:
     now = time.time()
     with _BANDWIDTH_LOCK:
         try:
-            net_io = psutil.net_io_counters()
-            rx = net_io.bytes_recv
-            tx = net_io.bytes_sent
-
+            io = psutil.net_io_counters()
+            rx, tx = io.bytes_recv, io.bytes_sent
             dt = now - _LAST_NET_IO["time"]
             if dt >= 0.5 and _LAST_NET_IO["time"] > 0:
-                rx_speed = ((rx - _LAST_NET_IO["rx"]) * 8) / (dt * 1_000_000)
-                tx_speed = ((tx - _LAST_NET_IO["tx"]) * 8) / (dt * 1_000_000)
-                rx_speed = max(0.0, round(rx_speed, 2))
-                tx_speed = max(0.0, round(tx_speed, 2))
+                rx_s = max(0.0, round(((rx - _LAST_NET_IO["rx"]) * 8) / (dt * 1_000_000), 2))
+                tx_s = max(0.0, round(((tx - _LAST_NET_IO["tx"]) * 8) / (dt * 1_000_000), 2))
             else:
-                rx_speed = 0.0
-                tx_speed = 0.0
-
+                rx_s = tx_s = 0.0
             _LAST_NET_IO = {"rx": rx, "tx": tx, "time": now}
-            return rx_speed, tx_speed
+            return rx_s, tx_s
         except Exception:
             return 0.0, 0.0
 
-# ─── Gateway Router Details ────────────────────────────────────────────────────
+# --- Scapy ARP Sweep ---
+def perform_scapy_arp_sweep(subnet: str) -> List[Dict[str, str]]:
+    """Active ARP broadcast sweep. Bypasses ICMP blocking, gets real MACs."""
+    results = []
+    try:
+        from scapy.all import ARP, Ether, srp
+        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=subnet),
+                     timeout=3, retry=2, verbose=False)
+        for _, rcv in ans:
+            ip = rcv.psrc
+            mac = rcv.hwsrc.upper()
+            randomized = is_randomized_mac(mac)
+            results.append({"ip_address": ip, "mac_address": mac,
+                             "vendor": None if randomized else get_mac_vendor(mac),
+                             "randomized_mac": randomized})
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[Scanner] Scapy ARP sweep error: {e}")
+    return results
+
+def parse_arp_table(target_subnet: str = None) -> List[Dict[str, str]]:
+    devices: Dict[str, Dict] = {}
+    target_net = None
+    if target_subnet:
+        try:
+            target_net = ipaddress.ip_network(target_subnet, strict=False)
+        except Exception:
+            pass
+
+    # Step 1: Active subnet priming via ultra-fast concurrent ping sweep
+    # Forces Windows / OS kernel to emit ARP requests on the wire for every IP.
+    # Every connected device (including sleeping phones with randomized MACs) replies at Layer 2
+    # and populates the OS kernel ARP cache!
+    if target_net and target_net.num_addresses <= 1024:
+        hosts_to_sweep = [str(ip) for ip in target_net.hosts()]
+        if platform.system() == "Windows":
+            def _ping_host(ip_str):
+                try:
+                    subprocess.run(["ping", "-n", "1", "-w", "120", ip_str],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+            with ThreadPoolExecutor(max_workers=64) as ex:
+                list(ex.map(_ping_host, hosts_to_sweep))
+        else:
+            def _ping_host_unix(ip_str):
+                try:
+                    subprocess.run(["ping", "-c", "1", "-W", "1", ip_str],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+            with ThreadPoolExecutor(max_workers=64) as ex:
+                list(ex.map(_ping_host_unix, hosts_to_sweep))
+
+    # Step 2: Read operating system ARP cache
+    try:
+        if platform.system() == "Windows":
+            out = subprocess.check_output(["arp", "-a"], stderr=subprocess.DEVNULL, timeout=10).decode("utf-8", errors="ignore")
+            for line in out.splitlines():
+                m = re.match(r'\s*([\d\.]+)\s+([\w\-:]+)\s+(dynamic|static)', line, re.IGNORECASE)
+                if m:
+                    ip, mac = m.group(1), m.group(2).replace("-", ":").upper()
+                    if ip.startswith("224.") or ip.startswith("239.") or ip.endswith(".255") or ip == "255.255.255.255":
+                        continue
+                    if target_net:
+                        try:
+                            if ipaddress.ip_address(ip) not in target_net:
+                                continue
+                        except Exception:
+                            continue
+                    randomized = is_randomized_mac(mac)
+                    devices[ip] = {
+                        "ip_address": ip,
+                        "mac_address": mac,
+                        "vendor": None if randomized else get_mac_vendor(mac),
+                        "randomized_mac": randomized
+                    }
+        else:
+            out = subprocess.check_output(["arp", "-n"], stderr=subprocess.DEVNULL, timeout=10).decode("utf-8", errors="ignore")
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and re.match(r'\d+\.\d+\.\d+\.\d+', parts[0]):
+                    ip = parts[0]
+                    if ip.startswith("224.") or ip.startswith("239.") or ip.endswith(".255") or ip == "255.255.255.255":
+                        continue
+                    if target_net:
+                        try:
+                            if ipaddress.ip_address(ip) not in target_net:
+                                continue
+                        except Exception:
+                            continue
+                    mac = parts[2].upper() if ":" in parts[2] else None
+                    if mac and mac != "(INCOMPLETE)" and ip not in devices:
+                        randomized = is_randomized_mac(mac)
+                        devices[ip] = {
+                            "ip_address": ip,
+                            "mac_address": mac,
+                            "vendor": None if randomized else get_mac_vendor(mac),
+                            "randomized_mac": randomized
+                        }
+    except Exception as e:
+        print(f"[Scanner] ARP cache error: {e}")
+
+    # Step 3: Ensure local host itself is included
+    try:
+        net_info = detect_local_network_info()
+        local_ip = net_info.get("local_ip")
+        if local_ip and local_ip not in devices:
+            if not target_net or ipaddress.ip_address(local_ip) in target_net:
+                import uuid
+                raw_mac = ':'.join(re.findall('..', '%012X' % uuid.getnode())).upper()
+                rand = is_randomized_mac(raw_mac)
+                devices[local_ip] = {
+                    "ip_address": local_ip,
+                    "mac_address": raw_mac,
+                    "vendor": None if rand else get_mac_vendor(raw_mac),
+                    "randomized_mac": rand
+                }
+    except Exception as e:
+        print(f"[Scanner] Local host detection notice: {e}")
+
+    return list(devices.values())
+
+# --- OS Name Cleaner ---
+def clean_os_name(os_name: str) -> str:
+    if not os_name:
+        return "Unknown OS"
+    n = os_name.lower()
+    if "windows 11" in n: return "Windows 11"
+    if "windows 10" in n: return "Windows 10"
+    if "windows server 2022" in n: return "Windows Server 2022"
+    if "windows server 2019" in n: return "Windows Server 2019"
+    if "windows server 2016" in n: return "Windows Server 2016"
+    if "windows server" in n: return "Windows Server"
+    if "windows" in n: return "Windows"
+    if "ios" in n and "cisco" not in n: return "iOS"
+    if "macos" in n or "mac os" in n or "os x" in n: return "macOS"
+    if "android" in n: return "Android OS"
+    if "ubuntu" in n: return "Ubuntu Linux"
+    if "debian" in n: return "Debian Linux"
+    if "centos" in n: return "CentOS Linux"
+    if "fedora" in n: return "Fedora Linux"
+    if "raspbian" in n: return "Raspbian Linux"
+    if "linux" in n: return "Linux"
+    if "freebsd" in n: return "FreeBSD"
+    if "openbsd" in n: return "OpenBSD"
+    if "tizen" in n: return "Tizen OS"
+    if "webos" in n: return "webOS"
+    if "embedded" in n or ("router" in n and "cisco ios" not in n): return "Embedded OS"
+    if "cisco ios" in n: return "Cisco IOS"
+    return os_name[:60]
+
+def infer_vendor_from_details(hostname: str = None, os_name: str = None, services: List[str] = None) -> Optional[str]:
+    """Infer hardware vendor from hostname, OS fingerprint, or running services when MAC is randomized."""
+    parts = []
+    if hostname: parts.append(hostname)
+    if os_name: parts.append(os_name)
+    if services: parts.extend(services)
+    combined = " ".join(parts).lower()
+    if any(k in combined for k in ["iphone", "ipad", "ipod", "apple", "ios", "macos", "macbook", "darwin"]):
+        return "Apple Inc."
+    if any(k in combined for k in ["samsung", "galaxy", "tizen"]):
+        return "Samsung Electronics"
+    if any(k in combined for k in ["pixel", "google", "chromecast"]):
+        return "Google"
+    if any(k in combined for k in ["xiaomi", "redmi", "poco", "mi phone"]):
+        return "Xiaomi"
+    if any(k in combined for k in ["oneplus"]):
+        return "OnePlus"
+    if any(k in combined for k in ["windows", "microsoft"]):
+        return "Microsoft Corporation"
+    if any(k in combined for k in ["linux", "ubuntu", "debian", "raspbian", "raspberry"]):
+        return "Linux / Raspberry Pi"
+    if any(k in combined for k in ["sony", "playstation", "bravia"]):
+        return "Sony"
+    if any(k in combined for k in ["lg", "webos"]):
+        return "LG Electronics"
+    if any(k in combined for k in ["amazon", "echo", "firetv", "kindle"]):
+        return "Amazon"
+    if any(k in combined for k in ["android"]):
+        return "Android Device"
+    return None
+
+# --- Device Classification ---
+def classify_device(hostname, vendor, os_name, open_ports, services=None, gateway_ip=None, device_ip=None, randomized_mac=False) -> Tuple[str, str]:
+    hostname = (hostname or "").lower().strip()
+    vendor   = (vendor or "").lower().strip()
+    os_clean = (os_name or "").lower().strip()
+    scores: Dict[str, int] = {}
+    def add(t, n): scores[t] = scores.get(t, 0) + n
+
+    if gateway_ip and device_ip and device_ip == gateway_ip:
+        return "Router", "High"
+    if any(x in hostname for x in ["gateway", "router", "gw.", "gw-", "rt-", "modem", "pfsense", "openwrt", "dd-wrt"]): add("Router", 40)
+    if any(x in vendor for x in ["netgear", "tp-link", "tplink", "cisco", "d-link", "linksys", "huawei", "ubiquiti", "zyxel", "mikrotik", "asus", "belkin", "arris", "aruba"]): add("Router", 25)
+    if 53 in open_ports and 1900 in open_ports: add("Router", 30)
+    if 67 in open_ports: add("Router", 35)
+    if "embedded" in os_clean and (80 in open_ports or 443 in open_ports): add("Router", 20)
+
+    if any(x in hostname for x in ["appletv", "samsung-tv", "lg-tv", "sony-tv", "firetv", "roku", "chromecast", "fire-tv", "shield", "webos", "smarttv"]): add("Smart TV", 55)
+    if "tizen" in os_clean or "webos" in os_clean: add("Smart TV", 60)
+    if 8001 in open_ports or 8060 in open_ports: add("Smart TV", 40)
+
+    if any(x in hostname for x in ["appletv", "roku", "chromecast", "firestick", "fire-tv", "nvidia-shield"]): add("Streaming Device", 50)
+    if "roku" in vendor: add("Streaming Device", 60)
+
+    if any(x in hostname for x in ["xbox", "playstation", "ps4", "ps5", "nintendo", "switch", "wii"]): add("Gaming Console", 70)
+    if any(x in vendor for x in ["sony interactive", "microsoft xbox", "nintendo"]): add("Gaming Console", 65)
+
+    if any(x in hostname for x in ["camera", "cam-", "ipcam", "cctv", "dvr", "nvr", "hikvision", "dahua", "axis", "foscam"]): add("IP Camera", 60)
+    if any(x in vendor for x in ["hikvision", "dahua", "axis", "foscam", "amcrest"]): add("IP Camera", 60)
+    if 554 in open_ports or 8554 in open_ports: add("IP Camera", 50)
+
+    if any(x in hostname for x in ["printer", "laserjet", "epson", "canon", "brother", "lexmark", "kyocera", "mfp"]): add("Printer", 60)
+    if any(x in vendor for x in ["brother", "canon", "epson", "lexmark", "kyocera", "hewlett packard", "hp inc", "xerox", "ricoh"]): add("Printer", 55)
+    if 9100 in open_ports or 515 in open_ports or 631 in open_ports: add("Printer", 50)
+
+    if any(x in hostname for x in ["nas", "synology", "qnap", "terastation", "freenas", "truenas", "readynas"]): add("NAS", 65)
+    if "synology" in vendor or "qnap" in vendor: add("NAS", 65)
+    if 5000 in open_ports or 5001 in open_ports: add("NAS", 40)
+
+    if any(x in hostname for x in ["server", "srv-", "backup", "db-", "sql", "proxmox", "esxi", "vmware-host"]): add("Server", 50)
+    if "windows server" in os_clean: add("Server", 55)
+    if any(p in open_ports for p in [3306, 5432, 1433, 6379, 27017, 5672, 9200]): add("Server", 40)
+
+    if any(x in hostname for x in ["iphone", "ipad", "ipod", "android", "galaxy", "pixel", "oneplus"]): add("Smartphone", 60)
+    if "ios" in os_clean: add("Smartphone", 60)
+    if "android" in os_clean and "tv" not in hostname: add("Smartphone", 55)
+
+    if any(x in hostname for x in ["ipad", "tablet", "kindle"]): add("Tablet", 60)
+
+    if any(x in hostname for x in ["laptop", "macbook", "thinkpad", "latitude", "elitebook", "xps", "surface", "notebook"]): add("Laptop", 60)
+    if "macbook" in hostname: add("Laptop", 70)
+    if "macos" in os_clean: add("Laptop", 35)
+
+    if any(x in hostname for x in ["desktop", "workstation", "pc-", "imac"]): add("Desktop", 55)
+    if "windows" in os_clean: add("Desktop", 20)
+    if any(p in open_ports for p in [3389, 135, 445]): add("Desktop", 20)
+
+    if any(x in hostname for x in ["esp", "esp8266", "esp32", "smart-bulb", "alexa", "echo", "hub", "nest", "hue", "ring", "wemo", "sonoff", "shelly"]): add("IoT Device", 55)
+    if any(x in vendor for x in ["espressif", "tuya", "shenzhen", "amazon", "philips lighting"]): add("IoT Device", 45)
+
+    if any(x in hostname for x in ["switch", "ap-", "access-point", "wap-"]): add("Network Infrastructure", 55)
+    if any(x in vendor for x in ["ubiquiti", "ruckus", "aruba", "juniper"]): add("Network Infrastructure", 40)
+
+    if not scores:
+        if randomized_mac:
+            return "Smartphone", "Medium"
+        return "Unknown Device", "Low"
+    best_type = max(scores, key=scores.get)
+    best_score = scores[best_type]
+    if best_score < 20:
+        if randomized_mac:
+            return "Smartphone", "Medium"
+        return "Unknown Device", "Low"
+    return best_type, "High" if best_score >= 60 else "Medium" if best_score >= 35 else "Low"
+
+def guess_device_type(hostname, vendor, os_name, open_ports, services=None, gateway_ip=None, device_ip=None, randomized_mac=False) -> str:
+    t, _ = classify_device(hostname, vendor, os_name, open_ports, services, gateway_ip, device_ip, randomized_mac)
+    return t
+
+def get_port_risk_and_desc(port: int, service: str) -> Tuple[str, str]:
+    PORT_INFO = {
+        21: ("High", "FTP: cleartext credentials. Replace with SFTP/SCP."),
+        22: ("Low", "SSH: encrypted remote access. Secure if key-auth enabled."),
+        23: ("High", "Telnet: cleartext sessions. CRITICAL: disable and use SSH."),
+        25: ("Medium", "SMTP: mail relay. Risk of open relay abuse."),
+        53: ("Low", "DNS: name resolution. Risk of amplification if open recursion."),
+        67: ("Low", "DHCP server. Normal for gateway/router devices."),
+        80: ("Medium", "HTTP: cleartext web traffic. Upgrade to HTTPS."),
+        110: ("Medium", "POP3: cleartext unless TLS configured."),
+        135: ("Medium", "Windows RPC. Restrict to trusted hosts."),
+        139: ("High", "NetBIOS: legacy Windows file sharing. Lateral movement risk."),
+        143: ("Medium", "IMAP: ensure TLS is enforced."),
+        443: ("Low", "HTTPS: encrypted web traffic. Ensure valid TLS cert."),
+        445: ("High", "SMB: EternalBlue/WannaCry vector. Restrict to LAN only."),
+        554: ("Low", "RTSP streaming. Restrict to authorized viewers."),
+        993: ("Low", "IMAPS: encrypted IMAP. Secure mail protocol."),
+        995: ("Low", "POP3S: encrypted POP3. Secure mail protocol."),
+        1433: ("High", "MSSQL: database exposed to network. Restrict immediately."),
+        1900: ("Low", "UPnP discovery. May expose device to LAN UPnP attacks."),
+        3306: ("High", "MySQL: database exposed. Critical risk."),
+        3389: ("Medium", "RDP: brute-force target. Use VPN or MFA."),
+        5000: ("Low", "NAS management web UI. Restrict to trusted clients."),
+        5432: ("High", "PostgreSQL: database exposed. Critical risk."),
+        5900: ("High", "VNC: brute-force vulnerable. Disable if not needed."),
+        5901: ("High", "VNC session 2: same risk as port 5900."),
+        6379: ("High", "Redis: often unauthenticated. Extremely high risk if exposed."),
+        8001: ("Low", "Samsung SmartTV API. Normal on Smart TV devices."),
+        8060: ("Low", "Roku device control. Normal on Roku streaming devices."),
+        8080: ("Medium", "Alt HTTP: cleartext. Often hosts admin panels."),
+        8443: ("Low", "Alt HTTPS: encrypted non-standard port."),
+        9100: ("Low", "Printer JetDirect. Restrict to print clients."),
+        515: ("Low", "LPD print service. Restrict to print clients."),
+        631: ("Low", "IPP print service."),
+        27017: ("High", "MongoDB: often unauthenticated. Critical if exposed."),
+    }
+    return PORT_INFO.get(port, ("Low", f"Network service on port {port}."))
+
+def calculate_security_score(ports: List[Dict[str, Any]]) -> int:
+    PENALTIES = {21: 25, 23: 35, 445: 25, 139: 15, 3306: 25, 5432: 25,
+                 6379: 30, 27017: 30, 1433: 25, 5900: 20, 5901: 20,
+                 80: 5, 8080: 8, 3389: 12, 135: 8, 110: 5, 143: 5}
+    score = 100
+    for p in ports:
+        if p.get("state") != "open":
+            continue
+        score -= PENALTIES.get(p.get("port"), 3)
+    open_count = sum(1 for p in ports if p.get("state") == "open")
+    if open_count > 6:
+        score -= (open_count - 6) * 3
+    return max(10, score)
+
+def parse_nmap_xml(xml_content: str, gateway_ip: str = None, arp_map: Dict[str, Dict] = None) -> List[Dict[str, Any]]:
+    devices = []
+    arp_map = arp_map or {}
+    try:
+        root = ET.fromstring(xml_content)
+        for host in root.findall("host"):
+            status = host.find("status")
+            if status is not None and status.get("state", "up") != "up":
+                continue
+            ip_address = mac_address = vendor = None
+            randomized_mac = False
+            for addr in host.findall("address"):
+                if addr.get("addrtype") == "ipv4":
+                    ip_address = addr.get("addr")
+                elif addr.get("addrtype") == "mac":
+                    mac_address = addr.get("addr", "").upper()
+                    vendor = addr.get("vendor") or None
+            if not ip_address:
+                continue
+            if ip_address in arp_map:
+                arp_data = arp_map[ip_address]
+                if not mac_address and arp_data.get("mac_address"):
+                    mac_address = arp_data["mac_address"]
+                if not vendor and arp_data.get("vendor"):
+                    vendor = arp_data["vendor"]
+                randomized_mac = arp_data.get("randomized_mac", False)
+            elif mac_address:
+                randomized_mac = is_randomized_mac(mac_address)
+                if randomized_mac:
+                    vendor = None
+                elif not vendor:
+                    vendor = get_mac_vendor(mac_address)
+            hostname = None
+            hostnames_el = host.find("hostnames")
+            if hostnames_el is not None:
+                hn = hostnames_el.find("hostname")
+                if hn is not None:
+                    hostname = hn.get("name")
+            os_name, firmware = "Unknown OS", None
+            os_el = host.find("os")
+            if os_el is not None:
+                best_match, best_acc = None, 0
+                for osmatch in os_el.findall("osmatch"):
+                    acc = int(osmatch.get("accuracy", 0))
+                    if acc > best_acc:
+                        best_acc, best_match = acc, osmatch
+                if best_match is not None:
+                    name = best_match.get("name", "Unknown OS")
+                    cleaned = clean_os_name(name)
+                    accuracy = best_match.get("accuracy", "0")
+                    os_name = f"{cleaned} ({accuracy}% confidence)" if int(accuracy) >= 70 else cleaned
+                for osclass in os_el.findall("osclass"):
+                    if osclass.get("type") in ("broadband router", "router", "switch", "firewall", "WAP"):
+                        fw = osclass.get("osgen")
+                        if fw:
+                            firmware = fw
+            ports, open_port_nums, services_found = [], [], []
+            ports_el = host.find("ports")
+            if ports_el is not None:
+                for pe in ports_el.findall("port"):
+                    pid = int(pe.get("portid", 0))
+                    proto = pe.get("protocol", "tcp")
+                    state_el = pe.find("state")
+                    state = state_el.get("state", "closed") if state_el is not None else "closed"
+                    if state != "open":
+                        continue
+                    open_port_nums.append(pid)
+                    svc_el = pe.find("service")
+                    svc_name = svc_el.get("name", "unknown") if svc_el is not None else "unknown"
+                    services_found.append(svc_name)
+                    product = (svc_el.get("product", "") if svc_el is not None else "").strip()
+                    version = (svc_el.get("version", "") if svc_el is not None else "").strip()
+                    svc_desc = f"{svc_name} ({' '.join(filter(None, [product, version]))})" if (product or version) else svc_name
+                    risk, rdesc = get_port_risk_and_desc(pid, svc_desc)
+                    ports.append({"port": pid, "protocol": proto, "service": svc_desc,
+                                  "state": "open", "risk_level": risk, "description": rdesc})
+            if not vendor or randomized_mac:
+                inferred = infer_vendor_from_details(hostname, os_name, services_found)
+                if inferred:
+                    vendor = f"{inferred} (Private MAC)" if randomized_mac else inferred
+                elif randomized_mac:
+                    vendor = "Private MAC (Privacy Feature)"
+
+            device_type, confidence = classify_device(hostname, vendor, os_name, open_port_nums, services_found,
+                                                       gateway_ip=gateway_ip, device_ip=ip_address, randomized_mac=randomized_mac)
+            security_score = calculate_security_score(ports)
+            uptime_val = "Unknown / Security Firewalled"
+            hs_el = host.find("hostscript")
+            if hs_el is not None:
+                for sc in hs_el.findall("script"):
+                    if sc.get("id") == "uptime":
+                        raw = sc.get("output", "").strip()
+                        uptime_val = raw.split(" (since")[0].strip() or uptime_val
+                        break
+            devices.append({
+                "ip_address": ip_address, "mac_address": mac_address, "hostname": hostname,
+                "vendor": vendor, "os_name": os_name, "firmware": firmware, "uptime": uptime_val,
+                "device_type": device_type, "classification_confidence": confidence,
+                "status": "up", "ports": ports, "security_score": security_score,
+                "randomized_mac": randomized_mac,
+            })
+    except Exception as e:
+        print(f"[Scanner] XML parse error: {e}")
+    return devices
 
 def get_gateway_router_details_sync(gateway_ip: str, simulation_mode: bool) -> dict:
-    """
-    Inspects gateway IP to discover router info with reliability.
-    Only shows confirmed info — never guesses vendor or model.
-    """
     details = {
-        "vendor": "Unavailable",
-        "model": "Unavailable",
-        "firmware": "Unavailable",
-        "os": "Unavailable",
-        "uptime": "Unavailable",
-        "lan_ip": gateway_ip or "Unavailable",
-        "wan_ip": "Detecting...",
-        "hostname": "Unavailable",
-        "interface_type": "Unavailable",
-        "dns_servers": "Unavailable",
-        "dhcp_range": "Unavailable",
-        "connection_type": "Unavailable",
-        "snmp_active": False,
-        "upnp_active": False,
-        "analytics": None
+        "vendor": "Unavailable", "model": "Unavailable", "firmware": "Unavailable",
+        "os": "Unavailable", "uptime": "Unavailable", "lan_ip": gateway_ip or "Unavailable",
+        "wan_ip": "Detecting...", "hostname": "Unavailable", "interface_type": "Unavailable",
+        "dns_servers": "Unavailable", "dhcp_range": "Unavailable", "connection_type": "Unavailable",
+        "snmp_active": False, "upnp_active": False, "analytics": None
     }
-
     net_info = detect_local_network_info()
     if net_info.get("dns_server"):
         details["dns_servers"] = net_info["dns_server"]
-
-    # Connection/Interface type heuristics from adapter name
     iface = net_info.get("interface", "").lower()
     adapter = net_info.get("adapter", "").lower()
-    if any(x in iface or x in adapter for x in ["wi-fi", "wireless", "802.11", "wlan", "wifi", "intel wireless", "realtek wireless"]):
+    if any(x in iface + adapter for x in ["wi-fi", "wireless", "802.11", "wlan", "wifi"]):
         details["interface_type"] = "Wireless (Wi-Fi)"
         details["connection_type"] = "Wireless"
-    elif any(x in iface or x in adapter for x in ["ethernet", "local area", "gigabit", "realtek pcie", "intel ethernet"]):
+    elif any(x in iface + adapter for x in ["ethernet", "local area", "gigabit"]):
         details["interface_type"] = "Wired (Ethernet)"
         details["connection_type"] = "Wired"
-
-
     if not gateway_ip:
         return details
-
-    # Resolve hostname via DNS (reliable)
     try:
         host, _, _ = socket.gethostbyaddr(gateway_ip)
         if host and host != gateway_ip:
             details["hostname"] = host
     except Exception:
-        details["hostname"] = "Unavailable"
-
-    # DHCP range heuristic
+        pass
     if gateway_ip:
         octets = gateway_ip.split(".")
         if len(octets) == 4:
-            details["dhcp_range"] = f"{octets[0]}.{octets[1]}.{octets[2]}.100 – {octets[0]}.{octets[1]}.{octets[2]}.254"
-
-    # Check open ports on gateway
+            details["dhcp_range"] = f"{octets[0]}.{octets[1]}.{octets[2]}.100 - {octets[0]}.{octets[1]}.{octets[2]}.254"
     try:
-        open_ports = []
         for port in [53, 80, 443, 161, 1900]:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(0.4)
-            res = s.connect_ex((gateway_ip, port))
-            if res == 0:
-                open_ports.append(port)
+            if s.connect_ex((gateway_ip, port)) == 0:
+                if port == 161: details["snmp_active"] = True
+                if port == 1900: details["upnp_active"] = True
             s.close()
-
-        details["snmp_active"] = (161 in open_ports)
-        details["upnp_active"] = (1900 in open_ports)
     except Exception:
         pass
-
-    # Pull confirmed data from DB if a previous scan logged this gateway
     try:
         with database.get_db() as db:
             dev = db.query(database.Device).filter(database.Device.ip_address == gateway_ip).first()
             if dev:
                 if dev.vendor and dev.vendor not in ("Unknown Manufacturer", "Unknown", None, ""):
                     details["vendor"] = dev.vendor
-                if details["hostname"] in ("Unavailable", None) and dev.hostname and dev.hostname != gateway_ip:
-                    details["hostname"] = dev.hostname
                 if dev.os_name and dev.os_name not in ("Unknown OS", "Unknown", None, ""):
                     details["os"] = dev.os_name
     except Exception:
         pass
-
-    # Local PC uptime (clearly labeled)
     try:
-        boot_time = datetime.datetime.fromtimestamp(psutil.boot_time())
-        uptime_delta = datetime.datetime.now() - boot_time
-        days = uptime_delta.days
-        hours, remainder = divmod(uptime_delta.seconds, 3600)
-        minutes, _ = divmod(remainder, 60)
-        details["uptime"] = f"{days}d {hours}h {minutes}m (Local PC uptime)"
+        boot = datetime.datetime.fromtimestamp(psutil.boot_time())
+        delta = datetime.datetime.now() - boot
+        d, rem = delta.days, delta.seconds
+        h, rem = divmod(rem, 3600)
+        m, _ = divmod(rem, 60)
+        details["uptime"] = f"{d}d {h}h {m}m (Local PC uptime)"
     except Exception:
-        details["uptime"] = "Unavailable"
-
-    # Fetch public WAN IP
+        pass
     wan = get_wan_ip()
-    details["wan_ip"] = wan if wan else "No Internet Access"
-
-    # Real-time bandwidth
+    details["wan_ip"] = wan or "No Internet Access"
     try:
-        rx_speed, tx_speed = get_realtime_bandwidth()
+        rx, tx = get_realtime_bandwidth()
         with database.get_db() as db:
             connected = db.query(database.Device).filter(database.Device.status == "up").count()
-        details["analytics"] = {
-            "upload_speed": tx_speed,
-            "download_speed": rx_speed,
-            "active_clients": connected,
-            "network_utilization": round(min(99.0, (rx_speed + tx_speed) * 5.0), 1),
-            "connected_devices": connected
-        }
+        details["analytics"] = {"upload_speed": tx, "download_speed": rx,
+                                 "active_clients": connected, "connected_devices": connected,
+                                 "network_utilization": round(min(99.0, (rx + tx) * 5.0), 1)}
     except Exception:
-        details["analytics"] = {
-            "upload_speed": 0.0,
-            "download_speed": 0.0,
-            "active_clients": 0,
-            "network_utilization": 0.0,
-            "connected_devices": 0
-        }
-
+        details["analytics"] = {"upload_speed": 0.0, "download_speed": 0.0,
+                                  "active_clients": 0, "connected_devices": 0, "network_utilization": 0.0}
     return details
 
-# ─── ARP Table Parser ──────────────────────────────────────────────────────────
+# --- Core Scan Engine (Thread-based, no asyncio subprocess) ---
+def _build_nmap_args(nmap_path: str, targets: Union[str, List[str]], profile: str) -> List[str]:
+    target_list = [targets] if isinstance(targets, str) else list(targets)
+    admin = is_admin()
+    sf = "-sS" if admin else "-sT"
+    os_flags = ["-O", "--osscan-guess"] if admin else []
+    base = [nmap_path]
+    pn_flag = ["-Pn"] if isinstance(targets, list) else []
 
-def perform_scapy_arp_discovery(target_subnet: str) -> List[Dict[str, str]]:
-    """Actively sweep the local subnet using Scapy ARP requests to find live hosts immediately."""
-    devices = []
-    try:
-        from scapy.all import ARP, Ether, srp
-        # Send ARP who-has to target_subnet
-        # timeout=2, retry=1 for quick results
-        ans, unans = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=target_subnet), timeout=2, retry=1, verbose=False)
-        for sent, received in ans:
-            ip = received.psrc
-            mac = received.hwsrc.upper()
-            devices.append({"ip_address": ip, "mac_address": mac})
-    except Exception as e:
-        print(f"[Scanner] Scapy ARP discovery failed: {e}")
-    return devices
-
-def parse_arp_table(target_subnet: str = None) -> List[Dict[str, str]]:
-    """Parse the OS ARP table and perform active Scapy sweep (if local subnet is provided) to get visible hosts."""
-    devices = {}
-    
-    # 1. Active Scapy ARP Sweep (if we know the target)
-    if target_subnet:
-        scapy_devices = perform_scapy_arp_discovery(target_subnet)
-        for d in scapy_devices:
-            devices[d["ip_address"]] = d["mac_address"]
-
-    # 2. Passive OS ARP Cache Parsing
-    try:
-        if platform.system() == "Windows":
-            out = subprocess.check_output(
-                ["arp", "-a"],
-                stderr=subprocess.DEVNULL,
-                timeout=10
-            ).decode("utf-8", errors="ignore")
-
-            for line in out.splitlines():
-                match = re.match(
-                    r'\s*([\d\.]+)\s+([\w\-:]+)\s+(dynamic|static)',
-                    line, re.IGNORECASE
-                )
-                if match:
-                    ip = match.group(1)
-                    mac = match.group(2).replace("-", ":").upper()
-                    if not ip.startswith("224.") and not ip.endswith(".255") and ip != "255.255.255.255":
-                        if ip not in devices:
-                            devices[ip] = mac
+    if profile == "quick":
+        if isinstance(targets, list):
+            return base + ["-sn"] + pn_flag + ["-T4", "--host-timeout", "10s",
+                           "--stats-every", "2s", "-oX", "-"] + target_list
         else:
-            out = subprocess.check_output(
-                ["arp", "-n"],
-                stderr=subprocess.DEVNULL,
-                timeout=10
-            ).decode("utf-8", errors="ignore")
-            for line in out.splitlines():
-                parts = line.split()
-                if len(parts) >= 3 and re.match(r'\d+\.\d+\.\d+\.\d+', parts[0]):
-                    ip = parts[0]
-                    mac = parts[2].upper() if ":" in parts[2] else None
-                    if mac and mac != "(INCOMPLETE)":
-                        if ip not in devices:
-                            devices[ip] = mac
-    except Exception as e:
-        print(f"[Scanner] OS ARP parse failed: {e}")
-        
-    return [{"ip_address": ip, "mac_address": mac} for ip, mac in devices.items()]
-
-# ─── OS Name Cleaner ──────────────────────────────────────────────────────────
-
-def clean_os_name(os_name: str) -> str:
-    if not os_name:
-        return "Unknown OS"
-    n = os_name.lower()
-    if "windows 11" in n:            return "Windows 11"
-    elif "windows 10" in n:          return "Windows 10"
-    elif "windows server 2022" in n: return "Windows Server 2022"
-    elif "windows server 2019" in n: return "Windows Server 2019"
-    elif "windows server" in n:      return "Windows Server"
-    elif "windows" in n:             return "Windows"
-    elif "ios" in n and "cisco" not in n: return "iOS"
-    elif "macos" in n or "mac os" in n or "os x" in n: return "macOS"
-    elif "android" in n:             return "Android OS"
-    elif "ubuntu" in n:              return "Ubuntu Linux"
-    elif "debian" in n:              return "Debian Linux"
-    elif "centos" in n:              return "CentOS Linux"
-    elif "fedora" in n:              return "Fedora Linux"
-    elif "raspbian" in n:            return "Raspbian Linux"
-    elif "linux" in n:               return "Linux"
-    elif "freebsd" in n:             return "FreeBSD"
-    elif "openbsd" in n:             return "OpenBSD"
-    elif "tizen" in n:               return "Tizen OS"
-    elif "webos" in n:               return "webOS"
-    elif "embedded" in n or "router" in n or "cisco ios" in n: return "Embedded OS"
-    else:                            return os_name[:50]  # preserve original if unrecognized
-
-# ─── Confidence-Based Device Classification ──────────────────────────────────
-
-def classify_device(
-    hostname: str,
-    vendor: str,
-    os_name: str,
-    open_ports: List[int],
-    services: List[str] = None,
-    gateway_ip: str = None,
-    device_ip: str = None
-) -> Tuple[str, str]:
-    """
-    Multi-signal confidence-based device classification.
-    Returns (device_type, confidence) where confidence is 'High', 'Medium', or 'Low'.
-    """
-    hostname  = (hostname or "").lower().strip()
-    vendor    = (vendor or "").lower().strip()
-    os_clean  = (os_name or "").lower().strip()
-    services_lower = [s.lower() for s in (services or [])]
-
-    scores: Dict[str, int] = {}
-
-    def add(dtype, pts):
-        scores[dtype] = scores.get(dtype, 0) + pts
-
-    # ── Gateway detection: strongest signal ─────────────────────────────────
-    if gateway_ip and device_ip and device_ip == gateway_ip:
-        return "Router", "High"
-    if any(x in hostname for x in ["gateway", "router", "gw.", "gw-", "rt-", "modem", "pfsense", "openwrt", "dd-wrt"]):
-        add("Router / Gateway", 40)
-    if any(x in vendor for x in ["netgear", "tp-link", "tplink", "cisco", "d-link", "linksys", "huawei", "ubiquiti", "zyxel", "mikrotik", "asus", "belkin", "arris"]):
-        add("Router / Gateway", 25)
-    if 53 in open_ports and 1900 in open_ports:
-        add("Router / Gateway", 30)  # DNS + UPnP = gateway fingerprint
-    if 67 in open_ports:  # DHCP server
-        add("Router / Gateway", 35)
-    if "embedded" in os_clean and (80 in open_ports or 443 in open_ports):
-        add("Router / Gateway", 20)
-
-    # ── Smart TV ────────────────────────────────────────────────────────────
-    if any(x in hostname for x in ["appletv", "samsung-tv", "lg-tv", "sony-tv", "firetv", "roku", "chromecast", "fire-tv", "shield", "webos", "smarttv"]):
-        add("Smart TV", 55)
-    if "tizen" in os_clean or "webos" in os_clean:
-        add("Smart TV", 60)
-    if "samsung" in vendor and "tv" in hostname:
-        add("Smart TV", 50)
-    if 8001 in open_ports or 8060 in open_ports:  # Samsung SmartTV API / Roku
-        add("Smart TV", 40)
-    if any("smart-tv" in s for s in services_lower):
-        add("Smart TV", 45)
-    if "android" in os_clean and ("tv" in hostname or 8001 in open_ports or 8060 in open_ports):
-        add("Smart TV", 40)
-
-    # ── Streaming Device ────────────────────────────────────────────────────
-    if any(x in hostname for x in ["appletv", "roku", "chromecast", "firestick", "fire-tv", "nvidia-shield"]):
-        add("Streaming Device", 50)
-    if "roku" in vendor:
-        add("Streaming Device", 60)
-
-    # ── Gaming Console ───────────────────────────────────────────────────────
-    if any(x in hostname for x in ["xbox", "playstation", "ps4", "ps5", "nintendo", "switch", "wii"]):
-        add("Gaming Console", 70)
-    if any(x in vendor for x in ["sony interactive", "microsoft xbox", "nintendo"]):
-        add("Gaming Console", 65)
-
-    # ── IP Camera / CCTV ────────────────────────────────────────────────────
-    if any(x in hostname for x in ["camera", "cam-", "ipcam", "cctv", "dvr", "nvr", "hikvision", "dahua", "axis", "onvif", "foscam"]):
-        add("IP Camera", 60)
-    if any(x in vendor for x in ["hikvision", "dahua", "axis", "foscam", "amcrest"]):
-        add("IP Camera", 60)
-    if 554 in open_ports or 8554 in open_ports:  # RTSP
-        add("IP Camera", 50)
-    if any("rtsp" in s or "onvif" in s for s in services_lower):
-        add("IP Camera", 55)
-
-    # ── Printer ─────────────────────────────────────────────────────────────
-    if any(x in hostname for x in ["printer", "laserjet", "epson", "canon", "brother", "lexmark", "kyocera", "copier", "mfp"]):
-        add("Printer", 60)
-    if any(x in vendor for x in ["brother", "canon", "epson", "lexmark", "kyocera", "hewlett packard", "hp inc", "xerox", "ricoh"]):
-        add("Printer", 55)
-    if 9100 in open_ports or 515 in open_ports or 631 in open_ports:
-        add("Printer", 50)
-
-    # ── NAS Storage ─────────────────────────────────────────────────────────
-    if any(x in hostname for x in ["nas", "synology", "qnap", "terastation", "freenas", "truenas", "readynas"]):
-        add("NAS", 65)
-    if "synology" in vendor or "qnap" in vendor:
-        add("NAS", 65)
-    if 5000 in open_ports or 5001 in open_ports:  # Synology DSM
-        add("NAS", 40)
-    if 5005 in open_ports:  # QNAP
-        add("NAS", 40)
-
-    # ── Server ───────────────────────────────────────────────────────────────
-    if any(x in hostname for x in ["server", "srv-", "backup", "db-", "sql", "proxmox", "esxi", "vmware-host"]):
-        add("Server", 50)
-    if "windows server" in os_clean:
-        add("Server", 55)
-    if 22 in open_ports and "linux" in os_clean and "raspberry" not in vendor:
-        add("Server", 20)
-    if any(p in open_ports for p in [3306, 5432, 1433, 6379, 27017, 5672, 9200]):
-        add("Server", 40)  # Databases
-
-    # ── Smartphone / Mobile ──────────────────────────────────────────────────
-    if any(x in hostname for x in ["iphone", "ipad", "ipod", "android", "galaxy", "pixel", "oneplus"]):
-        add("Smartphone", 60)
-    if "ios" in os_clean:
-        add("Smartphone", 60)
-    if "android" in os_clean and "tv" not in hostname:
-        add("Smartphone", 55)
-    if any(x in vendor for x in ["apple", "samsung electronics"]) and len(open_ports) == 0:
-        add("Smartphone", 30)
-
-    # ── Tablet ──────────────────────────────────────────────────────────────
-    if any(x in hostname for x in ["ipad", "tablet", "kindle"]):
-        add("Tablet", 60)
-
-    # ── Laptop ───────────────────────────────────────────────────────────────
-    if any(x in hostname for x in ["laptop", "macbook", "thinkpad", "latitude", "elitebook", "xps", "surface", "notebook"]):
-        add("Laptop", 60)
-    if "macbook" in hostname:
-        add("Laptop", 70)
-    if "macos" in os_clean:
-        add("Laptop", 35)
-    if "windows" in os_clean and any(x in hostname for x in ["laptop", "book", "portable"]):
-        add("Laptop", 40)
-
-    # ── Desktop ──────────────────────────────────────────────────────────────
-    if any(x in hostname for x in ["desktop", "workstation", "pc-", "imac"]):
-        add("Desktop", 55)
-    if "windows" in os_clean:
-        add("Desktop", 20)  # Windows is more likely a desktop than laptop without other signals
-    if any(p in open_ports for p in [3389, 135, 445]):
-        add("Desktop", 20)
-
-    # ── IoT Device ───────────────────────────────────────────────────────────
-    if any(x in hostname for x in ["esp", "esp8266", "esp32", "smart-bulb", "alexa", "echo", "hub", "nest", "hue", "ring", "wemo", "sonoff", "shelly"]):
-        add("IoT Device", 55)
-    if any(x in vendor for x in ["espressif", "tuya", "shenzhen", "amazon", "philips lighting"]):
-        add("IoT Device", 45)
-    if any(p in open_ports for p in [8008, 9000, 5000]):
-        add("IoT Device", 40)
-    if "raspberry" in vendor:
-        add("IoT Device", 30)
-
-    # ── Network Infrastructure ───────────────────────────────────────────────
-    if any(x in hostname for x in ["switch", "ap-", "access-point", "wap-", "hub-"]):
-        add("Network Infrastructure", 55)
-    if any(x in vendor for x in ["cisco", "ubiquiti", "ruckus", "aruba", "juniper"]) and "router" not in hostname:
-        add("Network Infrastructure", 40)
-
-    # ── Determine winner ─────────────────────────────────────────────────────
-    if not scores:
-        return "Unknown Device", "Low"
-
-    best_type  = max(scores, key=scores.get)
-    best_score = scores[best_type]
-
-    # Normalize confidence
-    if best_score >= 60:
-        confidence = "High"
-    elif best_score >= 35:
-        confidence = "Medium"
+            return base + ["-sn", "-T4", "-PE", "-PS22,80,443,3389,8080,8443", "-PA80,443",
+                           "--min-parallelism", "32", "--max-parallelism", "64",
+                           "--max-rtt-timeout", "500ms", "--host-timeout", "15s",
+                           "--stats-every", "2s", "-oX", "-"] + target_list
+    elif profile == "inventory":
+        return base + ["-sn", "-Pn", "-T4", "--host-timeout", "15s",
+                       "--stats-every", "3s", "-oX", "-"] + target_list
+    elif profile == "standard":
+        return base + [sf, "-sV"] + os_flags + ["-Pn", "-T4", "--top-ports", "100",
+                       "--script=banner", "--version-intensity", "5",
+                       "--min-parallelism", "20", "--max-parallelism", "50",
+                       "--max-rtt-timeout", "500ms", "--host-timeout", "60s",
+                       "--stats-every", "3s", "-oX", "-"] + target_list
+    elif profile == "deep":
+        return base + [sf, "-sV"] + os_flags + ["-Pn", "-T4", "--top-ports", "500",
+                       "--script=banner,uptime", "--version-intensity", "7",
+                       "--min-parallelism", "15", "--max-parallelism", "40",
+                       "--host-timeout", "120s", "--stats-every", "3s",
+                       "-oX", "-"] + target_list
+    elif profile == "audit":
+        return base + [sf, "-sV"] + os_flags + ["-Pn", "-T4", "--top-ports", "100",
+                       "--script=banner,vuln", "--version-intensity", "6",
+                       "--host-timeout", "180s", "--stats-every", "3s",
+                       "-oX", "-"] + target_list
     else:
-        confidence = "Low"
-
-    # If no strong signal, return Unknown
-    if best_score < 20:
-        return "Unknown Device", "Low"
-
-    return best_type, confidence
-
-# Legacy compatibility function
-def guess_device_type(
-    hostname: str, vendor: str, os_name: str,
-    open_ports: List[int], services: List[str] = None,
-    gateway_ip: str = None, device_ip: str = None
-) -> str:
-    dtype, _ = classify_device(hostname, vendor, os_name, open_ports, services, gateway_ip, device_ip)
-    return dtype
-
-# ─── Port Risk Classification ──────────────────────────────────────────────────
-
-def get_port_risk_and_desc(port: int, service: str) -> Tuple[str, str]:
-    service = (service or "").lower()
-    risk = "Low"
-    desc = f"Standard network service on port {port}."
-
-    PORT_INFO = {
-        21:   ("High",   "FTP sends credentials in plaintext. Vulnerable to credential harvesting and sniffing attacks."),
-        22:   ("Low",    "SSH provides encrypted remote access. Secure if strong key-based authentication is used."),
-        23:   ("High",   "Telnet transmits all sessions in plaintext. CRITICAL: Disable immediately and use SSH (22) instead."),
-        25:   ("Medium", "SMTP mail relay. Risk of spam relay abuse if misconfigured."),
-        53:   ("Low",    "DNS service. Could be used for DNS amplification attacks if open recursion is enabled."),
-        67:   ("Low",    "DHCP server port. Normal on gateway/router devices."),
-        80:   ("Medium", "HTTP transmits web traffic without encryption. Upgrade to HTTPS to protect session data."),
-        110:  ("Medium", "POP3 mail service. Transmits credentials in plaintext unless TLS is configured."),
-        135:  ("Medium", "Windows RPC service. Exposed to DCE/RPC-based attacks. Restrict to trusted hosts."),
-        139:  ("High",   "NetBIOS session service. Legacy Windows file sharing. High risk of lateral movement exploitation."),
-        143:  ("Medium", "IMAP mail service. Ensure TLS is enforced to protect credentials."),
-        443:  ("Low",    "HTTPS encrypted web traffic. Secure if TLS certificate is valid and up to date."),
-        445:  ("High",   "SMB file sharing. CRITICAL: Known vector for EternalBlue/WannaCry ransomware. Restrict to LAN only."),
-        554:  ("Low",    "RTSP streaming protocol. Used by IP cameras. Restrict access to authorized viewers only."),
-        993:  ("Low",    "IMAPS — encrypted IMAP. Secure mail retrieval protocol."),
-        995:  ("Low",    "POP3S — encrypted POP3. Secure mail retrieval protocol."),
-        1433: ("High",   "Microsoft SQL Server. Database port exposed to network. Restrict access immediately."),
-        1900: ("Low",    "UPnP discovery. May expose device to LAN-based UPnP attacks."),
-        3306: ("High",   "MySQL database service. Database exposure is a critical security risk."),
-        3389: ("Medium", "Remote Desktop Protocol (RDP). High risk of brute-force attacks. Use VPN or MFA."),
-        5000: ("Low",    "NAS management service (e.g. Synology DSM). Restrict to trusted clients."),
-        5432: ("High",   "PostgreSQL database. Database exposure is a critical security risk."),
-        5900: ("High",   "VNC remote desktop. Vulnerable to brute force. Disable if not needed."),
-        5901: ("High",   "VNC remote desktop session 2. Same risk profile as port 5900."),
-        6379: ("High",   "Redis database. Often runs without authentication. Extremely high risk if exposed."),
-        8001: ("Low",    "Samsung SmartTV API. Normal on Smart TV devices."),
-        8060: ("Low",    "Roku device control. Normal on Roku streaming devices."),
-        8080: ("Medium", "Alternative HTTP. Cleartext web traffic on non-standard port. Often hosts admin panels."),
-        8443: ("Low",    "Alternative HTTPS. Encrypted web traffic on non-standard port."),
-        9100: ("Low",    "Printer JetDirect service. Restrict to authorized print clients only."),
-        515:  ("Low",    "LPD printer service. Restrict to authorized print clients only."),
-        631:  ("Low",    "IPP printer service. Internet Printing Protocol."),
-        27017:("High",   "MongoDB database. Often runs without authentication. Critical risk if network-exposed."),
-    }
-
-    if port in PORT_INFO:
-        risk, desc = PORT_INFO[port]
-
-    return risk, desc
-
-# ─── Security Score ────────────────────────────────────────────────────────────
-
-def calculate_security_score(ports: List[Dict[str, Any]]) -> int:
-    score = 100
-    PENALTIES = {
-        21: 25, 23: 35, 445: 25, 139: 15, 3306: 25,
-        5432: 25, 6379: 30, 27017: 30, 1433: 25,
-        5900: 20, 5901: 20, 80: 5, 8080: 8, 3389: 12,
-        135: 8, 110: 5, 143: 5
-    }
-    for p in ports:
-        port_num = p.get("port")
-        if p.get("state") != "open":
-            continue
-        penalty = PENALTIES.get(port_num, 3)
-        score -= penalty
-
-    open_count = sum(1 for p in ports if p.get("state") == "open")
-    if open_count > 6:
-        score -= (open_count - 6) * 3
-
-    return max(10, score)
-
-# ─── Nmap XML Parser ────────────────────────────────────────────────────────────
-
-def parse_nmap_xml(xml_content: str, gateway_ip: str = None) -> List[Dict[str, Any]]:
-    devices = []
-    try:
-        root = ET.fromstring(xml_content)
-        for host in root.findall('host'):
-            status_elem = host.find('status')
-            if status_elem is not None and status_elem.get('state', 'up') != 'up':
-                continue
-
-            ip_address  = None
-            mac_address = None
-            vendor      = None
-
-            for addr in host.findall('address'):
-                addrtype = addr.get('addrtype')
-                if addrtype == 'ipv4':
-                    ip_address = addr.get('addr')
-                elif addrtype == 'mac':
-                    mac_address = addr.get('addr')
-                    vendor = addr.get('vendor', None)
-
-            if not ip_address:
-                continue
-
-            hostname = None
-            hostnames_elem = host.find('hostnames')
-            if hostnames_elem is not None:
-                hostname_elem = hostnames_elem.find('hostname')
-                if hostname_elem is not None:
-                    hostname = hostname_elem.get('name')
-
-            # Parse OS match
-            os_name = "Unknown OS"
-            firmware = None
-            os_elem = host.find('os')
-            if os_elem is not None:
-                osmatch_elem = os_elem.find('osmatch')
-                if osmatch_elem is not None:
-                    name     = osmatch_elem.get('name', 'Unknown OS')
-                    cleaned  = clean_os_name(name)
-                    accuracy = osmatch_elem.get('accuracy')
-                    if accuracy and int(accuracy) >= 70:
-                        os_name = f"{cleaned} ({accuracy}% confidence)"
-                    else:
-                        os_name = cleaned
-                
-                # Fetch deeper OS info (Kernel/Firmware) exactly as Nmap provides
-                for osclass in os_elem.findall('osclass'):
-                    if osclass.get('type') in ('broadband router', 'router', 'switch', 'firewall', 'WAP'):
-                        fw = osclass.get('osgen')
-                        if fw: firmware = fw
-                    elif osclass.get('type') == 'general purpose':
-                        # Try to capture kernel versions
-                        fam = osclass.get('osfamily')
-                        gen = osclass.get('osgen')
-                        if fam and gen and os_name == "Unknown OS":
-                            os_name = f"{fam} {gen}"
+        return _build_nmap_args(nmap_path, targets, "standard")
 
 
-            ports = []
-            open_port_nums  = []
-            services_found  = []
-            ports_elem = host.find('ports')
-            if ports_elem is not None:
-                for port_elem in ports_elem.findall('port'):
-                    port_id  = int(port_elem.get('portid'))
-                    protocol = port_elem.get('protocol', 'tcp')
-                    state_elem = port_elem.find('state')
-                    state = state_elem.get('state', 'closed') if state_elem is not None else 'closed'
-
-                    if state == 'open':
-                        open_port_nums.append(port_id)
-                        service_elem = port_elem.find('service')
-                        service_name = service_elem.get('name', 'unknown') if service_elem is not None else 'unknown'
-                        services_found.append(service_name)
-
-                        product = service_elem.get('product', '') if service_elem is not None else ''
-                        version = service_elem.get('version', '') if service_elem is not None else ''
-
-                        service_desc = (f"{service_name} ({product} {version})".strip(" ()")) if (product or version) else service_name
-                        risk, risk_desc = get_port_risk_and_desc(port_id, service_desc)
-
-                        ports.append({
-                            'port':       port_id,
-                            'protocol':   protocol,
-                            'service':    service_desc,
-                            'state':      state,
-                            'risk_level': risk,
-                            'description': risk_desc
-                        })
-
-            device_type, confidence = classify_device(
-                hostname, vendor, os_name, open_port_nums, services_found,
-                gateway_ip=gateway_ip, device_ip=ip_address
-            )
-            security_score = calculate_security_score(ports)
-
-            # ── Extract NSE uptime script result from hostscript block ─────────────────
-            uptime_val = None
-            hostscript_elem = host.find('hostscript')
-            if hostscript_elem is not None:
-                for script_el in hostscript_elem.findall('script'):
-                    if script_el.get('id') == 'uptime':
-                        raw_uptime = script_el.get('output', '').strip()
-                        # Strip the trailing date part ("since ...") for a clean value
-                        uptime_val = raw_uptime.split(' (since')[0].strip() or None
-                        break
-            if not uptime_val:
-                uptime_val = 'Unknown / Security Firewalled'
-
-            devices.append({
-                'ip_address':    ip_address,
-                'mac_address':   mac_address.upper() if mac_address else None,
-                'hostname':      hostname,
-                'vendor':        vendor,
-                'os_name':       os_name,
-                'firmware':      firmware,
-                'uptime':        uptime_val,
-                'device_type':   device_type,
-                'classification_confidence': confidence,
-                'status':        'up',
-                'ports':         ports,
-                'security_score': security_score
-            })
-    except Exception as e:
-        print(f"[Scanner] Error parsing Nmap XML: {e}")
-    return devices
-
-
-# ─── Real Nmap Scan Engine ────────────────────────────────────────────────────
-
-async def run_nmap_async(scan_id: int, target: str, scan_profile: str):
-    """Run a live Nmap scan. Requires Nmap to be installed — no simulation fallback."""
+def run_scan_thread(scan_id: int, target: str, profile: str):
+    """Main scan worker — runs in a dedicated daemon thread."""
+    abort_event = threading.Event()
+    _ABORT_EVENTS[scan_id] = abort_event
     try:
         nmap_path = get_nmap_path()
         if not nmap_path:
-            update_progress(scan_id, 0, "[ERROR] Nmap not found. Install Nmap from https://nmap.org and restart GuardNet.", "failed")
+            _update(scan_id, 0, "[ERROR] Nmap not found. Install Nmap 7.x from https://nmap.org", "failed")
             database.update_scan_status(scan_id, "failed", 0)
             return
 
-        update_progress(scan_id, 5, "[INFO] Scanner engine initialized. Nmap detected at: " + nmap_path, "running")
-        admin = is_admin()
-
-        # Detect gateway for classification
-        net_info   = detect_local_network_info()
+        _update(scan_id, 5, f"[INFO] Nmap detected at: {nmap_path}", "running")
+        net_info = detect_local_network_info()
         gateway_ip = net_info.get("gateway")
+        local_subnet = net_info.get("subnet", "")
 
-        # ── Build nmap argument list per profile ────────────────────────────
-        if scan_profile == "quick":
-            update_progress(scan_id, 10, "Quick Discovery — multi-probe host detection", "running")
-            args = [nmap_path,
-                "-sn",
-                "-R",
-                "-PE",
-                "-PS22,80,443,3389,8080",
-                "-PA80,443",
-                "-PU53,67,123",
-                "--min-parallelism", "100",
-                "--max-rtt-timeout", "300ms",
-                "--host-timeout", "5s",
-                "--stats-every", "3s",
-                "-oX", "-",
-                target
-            ]
+        # Phase 1: ARP sweep for accurate MAC resolution
+        _update(scan_id, 8, "[INFO] Performing ARP sweep for accurate MAC resolution...", "running")
+        arp_results, arp_map = [], {}
+        try:
+            is_local = False
+            try:
+                net_obj = ipaddress.IPv4Network(target, strict=False)
+                local_net = ipaddress.IPv4Network(local_subnet, strict=False)
+                is_local = net_obj.overlaps(local_net) or str(net_obj) == str(local_net)
+            except Exception:
+                pass
+            if is_local:
+                arp_results = parse_arp_table(target)
+                arp_map = {d["ip_address"]: d for d in arp_results}
+                rc = sum(1 for d in arp_results if d.get("randomized_mac"))
+                _update(scan_id, 12, f"[INFO] ARP sweep: {len(arp_results)} hosts ({rc} with randomized MACs)", "running")
+                if rc > 0:
+                    _update(scan_id, None, f"[INFO] {rc} device(s) use randomized MACs — private address resolution enabled.", "running")
+            else:
+                _update(scan_id, 12, "[INFO] Remote target — skipping local ARP sweep.", "running")
+        except Exception as arp_err:
+            print(f"[Scanner] ARP error: {arp_err}")
 
-        elif scan_profile == "inventory":
-            # Inventory Refresh: re-check previously discovered devices
-            update_progress(scan_id, 10, "Inventory Refresh — rechecking known hosts", "running")
+        if abort_event.is_set():
+            _update(scan_id, 100, "[INFO] Scan aborted.", "aborted")
+            database.update_scan_status(scan_id, "failed", 0)
+            return
+
+        # Phase 2: Select targets & build command
+        if profile == "inventory":
+            _update(scan_id, 15, "[INFO] Inventory Refresh — rechecking known hosts.", "running")
             try:
                 with database.get_db() as db:
                     db_ips = [d.ip_address for d in db.query(database.Device).all()]
             except Exception:
                 db_ips = []
-
             if not db_ips:
-                update_progress(scan_id, 100, "No devices in inventory to refresh", "completed")
+                db_ips = [d["ip_address"] for d in arp_results if d.get("ip_address")]
+            if not db_ips:
+                _update(scan_id, 100, "[INFO] No devices in inventory to refresh.", "completed")
                 database.update_scan_status(scan_id, "completed", 0)
                 return
+            args = _build_nmap_args(nmap_path, db_ips, "inventory")
+        else:
+            # If we already found alive hosts via ARP on local subnet,
+            # target those active IPs directly across all profiles.
+            # This makes the scan blazing fast and eliminates dead IP timeouts!
+            if arp_results and is_local:
+                alive_ips = [d["ip_address"] for d in arp_results if d.get("ip_address")]
+                if alive_ips:
+                    _update(scan_id, 14, f"[INFO] Targeting {len(alive_ips)} active hosts detected on subnet.", "running")
+                    args = _build_nmap_args(nmap_path, alive_ips, profile)
+                else:
+                    args = _build_nmap_args(nmap_path, target, profile)
+            else:
+                args = _build_nmap_args(nmap_path, target, profile)
 
-            args = [nmap_path,
-                "-sn",
-                "-PE",
-                "-PS22,80,443,3389",
-                "--stats-every", "3s",
-                "-oX", "-"
-            ] + db_ips
-
-        elif scan_profile == "deep":
-            update_progress(scan_id, 10, "Deep Inspection — service version and OS detection", "running")
-            scan_method = "-sS" if admin else "-sT"
-            args = [nmap_path,
-                scan_method,
-                "-sV",
-                "-O",
-                "-R",
-                "-PE",
-                "-PS22,80,443,3389,8080",
-                "-PA80,443",
-                "--script=banner,uptime",
-                "-T4",
-                "--version-intensity", "5",
-                "--min-parallelism", "50",
-                "--host-timeout", "60s",
-                "--stats-every", "3s",
-                "-oX", "-",
-                target
-            ]
-
-        elif scan_profile == "audit":
-            update_progress(scan_id, 10, "Security Audit — service analysis and vulnerability checks", "running")
-            scan_method = "-sS" if admin else "-sT"
-            args = [nmap_path,
-                scan_method,
-                "-sV",
-                "-O",
-                "-R",
-                "-PE",
-                "-PS22,80,443,3389,8080",
-                "-PA80,443",
-                "--script=banner,vuln",
-                "-T4",
-                "--version-intensity", "5",
-                "--host-timeout", "120s",
-                "--stats-every", "3s",
-                "-oX", "-",
-                target
-            ]
-
-        else:  # standard
-            update_progress(scan_id, 10, "Standard Scan — top 1000 TCP ports with host discovery", "running")
-            scan_method = "-sS" if admin else "-sT"
-            args = [nmap_path,
-                scan_method,
-                "-sV",
-                "-O",
-                "-R",
-                "-PE",
-                "-PS22,80,443,3389,8080",
-                "-PA80,443",
-                "--script=banner",
-                "-T4",
-                "--version-intensity", "5",
-                "--min-parallelism", "50",
-                "--max-rtt-timeout", "500ms",
-                "--host-timeout", "30s",
-                "--stats-every", "3s",
-                "-oX", "-",
-                target
-            ]
-
-        # ── Also grab ARP table before scan (augments discovery) ────────────
+        # Phase 3: Launch nmap process
+        _update(scan_id, 15, f"[INFO] Launching nmap scan (profile: {profile})...", "running")
         try:
-            # Check if target is a local subnet
-            is_local = gateway_ip and any(target.startswith(gateway_ip.rsplit('.', 1)[0]) for _ in range(1))
-            arp_subnet = target if is_local else None
-            arp_hosts = parse_arp_table(arp_subnet)
-        except Exception:
-            arp_hosts = []
-
-        # ── Launch Nmap process ─────────────────────────────────────────────────
-        process = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        _ACTIVE_PROCESSES[scan_id] = process
-        update_progress(scan_id, 15, "[INFO] Probing subnet masks. Scanning active target services...", "running")
-
-        # Parse Nmap stderr progress lines — emit clean [INFO] phase messages
-        _last_logged_pct = [0]  # Track last logged milestone to cap log volume
-        async def read_stderr(stream):
-            while True:
-                line_bytes = await stream.readline()
-                if not line_bytes:
-                    break
-                line = line_bytes.decode('utf-8', errors='ignore').strip()
-                if not line:
-                    continue
-                match = re.search(r"About\s+(\d+(?:\.\d+)?)%\s+done", line, re.IGNORECASE)
-                if match:
-                    pct = float(match.group(1))
-                    mapped_pct = int(15 + (pct / 100.0) * 70)
-
-                    # Emit at most one log per 33% milestone to keep console clean
-                    milestone = int(pct // 33)
-                    if milestone > _last_logged_pct[0]:
-                        _last_logged_pct[0] = milestone
-                        if scan_profile == "deep":
-                            if pct > 60:   phase = "[INFO] Identifying operating systems via TCP/IP stack fingerprinting."
-                            elif pct > 30: phase = "[INFO] Service version banners captured. Correlating software signatures."
-                            else:          phase = "[INFO] Enumerating open ports on discovered hosts."
-                        elif scan_profile == "audit":
-                            if pct > 40:   phase = "[INFO] Running vulnerability check scripts against exposed services."
-                            else:          phase = "[INFO] Enumerating active services and software versions."
-                        elif scan_profile == "standard":
-                            if pct > 40:   phase = "[INFO] Scanning active target services. Grabbing service banners."
-                            else:          phase = "[INFO] Discovering active hosts on target subnet."
-                        elif scan_profile == "quick":
-                            phase = "[INFO] Host discovery sweep in progress."
-                        elif scan_profile == "inventory":
-                            phase = "[INFO] Verifying reachability of known inventory devices."
-                        else:
-                            phase = "[INFO] Scanning in progress."
-                        update_progress(scan_id, mapped_pct, phase, "running")
-
-        # Buffer stdout chunks
-        stdout_chunks = []
-        async def read_stdout(stream):
-            while True:
-                chunk = await stream.read(65536)
-                if not chunk:
-                    break
-                stdout_chunks.append(chunk)
-
-        stderr_task = asyncio.create_task(read_stderr(process.stderr))
-        stdout_task = asyncio.create_task(read_stdout(process.stdout))
-
-        await asyncio.gather(stdout_task, stderr_task)
-        await process.wait()
-        _ACTIVE_PROCESSES.pop(scan_id, None)
-
-        stdout = b"".join(stdout_chunks)
-
-        # ── Check if scan was aborted ─────────────────────────────────────────
-        if is_scan_aborted(scan_id):
-            update_progress(scan_id, 100, "[INFO] Scan aborted by user.", "aborted")
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            _update(scan_id, 0, f"[ERROR] Cannot execute nmap at: {nmap_path}", "failed")
             database.update_scan_status(scan_id, "failed", 0)
             return
 
-        # ── Handle non-zero return code ──────────────────────────────────────
-        if process.returncode != 0 and process.returncode is not None:
-            err_msg = stdout.decode('utf-8', errors='ignore').strip()
-            if any(x in err_msg.lower() for x in ["root", "permission", "administrator", "requires"]):
-                update_progress(scan_id, 50, "Insufficient privileges — retrying with TCP connect scan", "running")
-                args2 = [nmap_path, "-sT", "-PE", "-PS22,80,443,3389", "-T4", "-oX", "-", target]
-                process2 = await asyncio.create_subprocess_exec(
-                    *args2,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, _ = await process2.communicate()
-                if process2.returncode != 0:
-                    update_progress(scan_id, 100, "Scan failed — check network and permissions", "failed")
+        _ACTIVE_PROCESSES[scan_id] = proc
+        stderr_lines, stdout_chunks = [], []
+        last_pct = [0]
+
+        def read_stderr():
+            for raw in proc.stderr:
+                if abort_event.is_set():
+                    break
+                line = raw.decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
+                stderr_lines.append(line)
+                m = re.search(r"About\s+(\d+(?:\.\d+)?)%\s+done", line, re.IGNORECASE)
+                if m:
+                    pct = float(m.group(1))
+                    mapped = int(15 + (pct / 100.0) * 72)
+                    milestone = int(pct // 20)
+                    if milestone > last_pct[0]:
+                        last_pct[0] = milestone
+                        phase_msgs = {
+                            "quick": f"Host discovery sweep ({pct:.0f}%)...",
+                            "standard": f"Scanning ports and services ({pct:.0f}%)...",
+                            "deep": f"Deep scan + OS fingerprinting ({pct:.0f}%)...",
+                            "audit": f"Running vulnerability checks ({pct:.0f}%)...",
+                            "inventory": f"Checking inventory devices ({pct:.0f}%)...",
+                        }
+                        _update(scan_id, mapped, f"[INFO] {phase_msgs.get(profile, f'Scanning ({pct:.0f}%)...')}", "running")
+
+        def read_stdout():
+            for chunk in iter(lambda: proc.stdout.read(65536), b""):
+                if abort_event.is_set():
+                    break
+                stdout_chunks.append(chunk)
+
+        t_err = threading.Thread(target=read_stderr, daemon=True)
+        t_out = threading.Thread(target=read_stdout, daemon=True)
+        t_err.start()
+        t_out.start()
+
+        while proc.poll() is None:
+            if abort_event.is_set():
+                proc.kill()
+                break
+            time.sleep(0.5)
+
+        t_out.join(timeout=10)
+        t_err.join(timeout=5)
+        _ACTIVE_PROCESSES.pop(scan_id, None)
+
+        if abort_event.is_set():
+            _update(scan_id, 100, "[INFO] Scan aborted by user.", "aborted")
+            database.update_scan_status(scan_id, "failed", 0)
+            return
+
+        returncode = proc.returncode
+        raw_xml = b"".join(stdout_chunks).decode("utf-8", errors="ignore")
+
+        # Phase 4: Handle non-zero return or missing XML
+        if returncode != 0 and "<nmaprun" not in raw_xml:
+            stderr_text = "\n".join(stderr_lines)
+            if any(x in stderr_text.lower() for x in ["root", "permission", "administrator", "requires", "winpcap", "npcap"]):
+                _update(scan_id, 40, "[WARN] Privilege/Npcap issue — retrying with TCP connect scan...", "running")
+                retry_args = [nmap_path, "-sT", "-T4", "-PE", "-PS22,80,443",
+                               "--host-timeout", "30s", "-oX", "-", target]
+                try:
+                    p2 = subprocess.run(retry_args, capture_output=True, timeout=180)
+                    raw_xml = p2.stdout.decode("utf-8", errors="ignore")
+                    if p2.returncode != 0 and "<nmaprun" not in raw_xml:
+                        _update(scan_id, 100, f"[ERROR] Scan failed after retry. stderr: {stderr_text[:200]}", "failed")
+                        database.update_scan_status(scan_id, "failed", 0)
+                        return
+                except Exception as e2:
+                    _update(scan_id, 100, f"[ERROR] Retry failed: {e2}", "failed")
                     database.update_scan_status(scan_id, "failed", 0)
                     return
             else:
-                update_progress(scan_id, 100, "Scan encountered an error — check target subnet", "failed")
+                _update(scan_id, 100, f"[ERROR] Nmap exited with code {returncode}. Verify target.", "failed")
                 database.update_scan_status(scan_id, "failed", 0)
                 return
 
-        update_progress(scan_id, 88, "Parsing scan results", "running")
-        xml_content = stdout.decode('utf-8', errors='ignore')
+        # Phase 5: Parse results
+        _update(scan_id, 88, "[INFO] Parsing scan results...", "running")
+        devices, discovered_ips = [], []
 
-        # ── Parse results ────────────────────────────────────────────────────
-        if not xml_content.strip() or '<nmaprun' not in xml_content:
-            # Fall back to ARP data for quick/standard scans
-            if arp_hosts and scan_profile in ("quick", "standard"):
-                devices = []
-                for h in arp_hosts:
-                    dtype, conf = classify_device(
-                        None, None, None, [], gateway_ip=gateway_ip, device_ip=h['ip_address']
-                    )
+        if "<nmaprun" in raw_xml:
+            devices = parse_nmap_xml(raw_xml, gateway_ip=gateway_ip, arp_map=arp_map)
+            discovered_ips = [d["ip_address"] for d in devices]
+
+        # Augment with any ARP hosts not seen by nmap (ACROSS ALL PROFILES!)
+        nmap_ips = set(discovered_ips)
+        for h in arp_results:
+            if h["ip_address"] not in nmap_ips:
+                is_rand = h.get("randomized_mac", False)
+                h_vendor = h.get("vendor") or ("Private MAC (Privacy Feature)" if is_rand else None)
+                dtype, conf = classify_device(None, h_vendor, None, [],
+                                               gateway_ip=gateway_ip, device_ip=h["ip_address"], randomized_mac=is_rand)
+                devices.append({
+                    "ip_address": h["ip_address"], "mac_address": h.get("mac_address"),
+                    "hostname": None, "vendor": h_vendor, "os_name": "Unknown OS",
+                    "firmware": None, "uptime": "Unknown", "device_type": dtype,
+                    "classification_confidence": conf, "status": "up", "ports": [],
+                    "security_score": 100, "randomized_mac": is_rand,
+                })
+                discovered_ips.append(h["ip_address"])
+
+        if not devices:
+            if arp_results:
+                for h in arp_results:
+                    is_rand = h.get("randomized_mac", False)
+                    h_vendor = h.get("vendor") or ("Private MAC (Privacy Feature)" if is_rand else None)
+                    dtype, conf = classify_device(None, h_vendor, None, [],
+                                                   gateway_ip=gateway_ip, device_ip=h["ip_address"], randomized_mac=is_rand)
                     devices.append({
-                        'ip_address':  h['ip_address'],
-                        'mac_address': h.get('mac_address'),
-                        'hostname':    None,
-                        'vendor':      None,
-                        'os_name':     'Unknown OS',
-                        'device_type': dtype,
-                        'classification_confidence': conf,
-                        'status':      'up',
-                        'ports':       [],
-                        'security_score': 100
+                        "ip_address": h["ip_address"], "mac_address": h.get("mac_address"),
+                        "hostname": None, "vendor": h_vendor, "os_name": "Unknown OS",
+                        "firmware": None, "uptime": "Unknown", "device_type": dtype,
+                        "classification_confidence": conf, "status": "up", "ports": [],
+                        "security_score": 100, "randomized_mac": is_rand,
                     })
-                discovered_ips = [d['ip_address'] for d in devices]
-                update_progress(scan_id, 93, f"ARP table found {len(devices)} hosts", "running")
+                    discovered_ips.append(h["ip_address"])
             else:
-                update_progress(scan_id, 100, "Scan returned no hosts — verify target subnet", "failed")
+                _update(scan_id, 100, "[ERROR] Scan returned no results. Verify target subnet.", "failed")
                 database.update_scan_status(scan_id, "failed", 0)
                 return
-        else:
-            devices = parse_nmap_xml(xml_content, gateway_ip=gateway_ip)
-            discovered_ips = [dev["ip_address"] for dev in devices]
 
-            # Augment with ARP entries not found by nmap
-            if scan_profile in ("quick", "standard"):
-                nmap_ips = set(discovered_ips)
-                for h in arp_hosts:
-                    if h['ip_address'] not in nmap_ips:
-                        dtype, conf = classify_device(
-                            None, None, None, [], gateway_ip=gateway_ip, device_ip=h['ip_address']
-                        )
-                        devices.append({
-                            'ip_address':  h['ip_address'],
-                            'mac_address': h.get('mac_address'),
-                            'hostname':    None,
-                            'vendor':      None,
-                            'os_name':     'Unknown OS',
-                            'device_type': dtype,
-                            'classification_confidence': conf,
-                            'status':      'up',
-                            'ports':       [],
-                            'security_score': 100
-                        })
-                        discovered_ips.append(h['ip_address'])
+        _update(scan_id, 93, f"[INFO] {len(devices)} host(s) found. Running security analysis...", "running")
 
-        update_progress(scan_id, 93, "[INFO] Performing risk analysis and security scoring.", "running")
-
-        # ── Store results in database ─────────────────────────────────────────
+        # Phase 6: Store in DB
         for dev in devices:
             try:
                 device_id = database.upsert_device(
-                    scan_id=scan_id,
-                    ip_address=dev["ip_address"],
-                    mac_address=dev.get("mac_address"),
-                    hostname=dev.get("hostname"),
-                    vendor=dev.get("vendor"),
-                    device_type=dev.get("device_type", "Unknown Device"),
-                    os_name=dev.get("os_name"),
-                    status=dev.get("status", "up"),
-                    classification_confidence=dev.get("classification_confidence"),
-                    is_simulation=False
+                    scan_id=scan_id, ip_address=dev["ip_address"],
+                    mac_address=dev.get("mac_address"), hostname=dev.get("hostname"),
+                    vendor=dev.get("vendor"), device_type=dev.get("device_type", "Unknown Device"),
+                    os_name=dev.get("os_name"), status=dev.get("status", "up"),
+                    classification_confidence=dev.get("classification_confidence"), is_simulation=False
                 )
                 database.update_device_ports_with_diff(device_id, dev.get("ports", []), scan_id)
-                score = calculate_security_score(
-                    [{"port": p["port"], "state": p["state"]} for p in dev.get("ports", [])]
-                )
+                score = calculate_security_score([{"port": p["port"], "state": p["state"]} for p in dev.get("ports", [])])
                 database.update_device_security_score(device_id, score)
             except Exception as dev_err:
-                print(f"[Scanner] Error storing device {dev.get('ip_address')}: {dev_err}")
-                continue
+                print(f"[Scanner] DB error for {dev.get('ip_address')}: {dev_err}")
 
-        if scan_profile not in ("quick",):
+        if profile not in ("quick",):
             try:
                 database.mark_offline_missing_devices(scan_id, target, discovered_ips)
             except Exception:
                 pass
 
+        rc_count = sum(1 for d in devices if d.get("randomized_mac"))
+        extra = f" ({rc_count} device(s) have randomized MACs)" if rc_count else ""
         database.update_scan_status(scan_id, "completed", len(devices))
-        update_progress(scan_id, 100, f"[INFO] Scan complete. {len(devices)} host(s) discovered and recorded to inventory.", "completed")
+        _update(scan_id, 100, f"[INFO] Scan complete. {len(devices)} host(s) discovered.{extra}", "completed")
 
     except Exception as e:
         import traceback
@@ -1344,124 +1095,77 @@ async def run_nmap_async(scan_id: int, target: str, scan_profile: str):
             database.update_scan_status(scan_id, "failed", 0)
         except Exception:
             pass
-        update_progress(scan_id, 100, "Scanner encountered an unexpected error", "failed")
+        _update(scan_id, 100, f"[ERROR] Scanner crashed: {e}", "failed")
+    finally:
+        _ABORT_EVENTS.pop(scan_id, None)
+        _ACTIVE_PROCESSES.pop(scan_id, None)
 
 
 def start_scan_job(scan_id: int, target: str, scan_profile: str, simulation_mode: bool = False):
-    """Dispatch a live Nmap scan job."""
-    update_progress(scan_id, 0, "[INFO] Scan job queued. Awaiting Nmap engine initialization.", "running")
+    """Start scan in a background daemon thread."""
+    _update(scan_id, 0, "[INFO] Scan queued — initializing...", "running")
+    t = threading.Thread(target=run_scan_thread, args=(scan_id, target, scan_profile),
+                         daemon=True, name=f"scan-{scan_id}")
+    t.start()
 
-    if _EVENT_LOOP is not None and _EVENT_LOOP.is_running():
-        asyncio.run_coroutine_threadsafe(
-            run_nmap_async(scan_id, target, scan_profile),
-            _EVENT_LOOP
-        )
-    else:
-        def _run_in_thread():
-            asyncio.run(run_nmap_async(scan_id, target, scan_profile))
-        threading.Thread(target=_run_in_thread, daemon=True).start()
-
-
-# ─── Discovery Diagnostics ───────────────────────────────────────────────────
 
 def get_discovery_diagnostics() -> Dict[str, Any]:
-    """
-    Returns a full diagnostic snapshot:
-    - Active adapter name, IP, gateway, subnet, netmask, DNS
-    - Nmap availability, path, version
-    - Npcap driver status
-    - Admin/root privilege status
-    - ARP-visible hosts (immediately reachable without scanning)
-    - Human-readable limitations list
-    """
     net = detect_local_network_info()
     nmap_path = get_nmap_path()
-    admin = is_admin()
-
-    # Check npcap
     npcap_available = False
     try:
         if platform.system() == "Windows":
-            npcap_dir = r"C:\Windows\System32\Npcap"
-            npcap_available = os.path.isdir(npcap_dir)
+            npcap_available = os.path.isdir(r"C:\Windows\System32\Npcap")
         else:
             npcap_available = shutil.which("libpcap") is not None or os.path.exists("/usr/lib/libpcap.so")
     except Exception:
         pass
-
-    # Check scapy
     scapy_available = False
     try:
         import importlib.util
         scapy_available = importlib.util.find_spec("scapy") is not None
     except Exception:
         pass
-
-    # Get ARP host list (valid unicast IPs only)
     try:
-        arp_hosts = parse_arp_table(target)
+        arp_hosts = parse_arp_table()
     except Exception:
         arp_hosts = []
     arp_ips = sorted(set(
         h["ip_address"] for h in arp_hosts
-        if not h["ip_address"].startswith("224.")
-        and not h["ip_address"].endswith(".255")
-        and h["ip_address"] != "255.255.255.255"
+        if not h["ip_address"].startswith("224.") and not h["ip_address"].endswith(".255")
     ))
-
-    # Build limitations list
-    limitations = []
-    if not admin:
-        limitations.append(
-            "Not running as Administrator — SYN/ARP scanning is disabled. "
-            "Use TCP-Connect scanning (slower, less stealthy). "
-            "Run GuardNet as Administrator for full discovery capabilities."
-        )
+    limitations = [
+        "Mobile devices with randomized MACs cannot be tracked between scans — each scan may show them as a new device.",
+        "Devices blocking all ICMP and TCP probes may not appear — this is a network-level limitation.",
+    ]
     if not npcap_available:
-        limitations.append(
-            "Npcap driver not detected — raw packet capture unavailable. "
-            "Install Npcap from https://npcap.com for ARP-based active discovery."
-        )
+        limitations.append("Npcap not detected — install from https://npcap.com for fastest SYN scans.")
     if not nmap_path:
-        limitations.append(
-            "Nmap not found — only ARP-table passive discovery is available. "
-            "Install Nmap from https://nmap.org/download to enable active scanning."
-        )
+        limitations.append("Nmap not found — install from https://nmap.org for active scanning.")
     if not scapy_available:
-        limitations.append(
-            "Scapy not installed — Python-native ARP sweep unavailable. "
-            "Optional: pip install scapy for supplemental discovery."
-        )
-    limitations.append(
-        "Devices that block ICMP (ping) and are not in the ARP table cannot be "
-        "observed by GuardNet. This is a fundamental network limitation, not a bug."
-    )
-    limitations.append(
-        "Mobile devices with randomized MAC addresses may appear as new devices on "
-        "each scan, even if they are known devices."
-    )
-
+        limitations.append("Scapy not installed — run: pip install scapy")
     return {
-        "active_adapter":   net.get("adapter") or net.get("interface") or "Unknown",
-        "adapter_name":     net.get("adapter") or net.get("interface") or "Unknown",
-        "detected_subnet":  net.get("subnet", "Unknown"),
-        "local_ip":         net.get("local_ip", "Unknown"),
-        "gateway":          net.get("gateway", "Unknown"),
-        "netmask":          net.get("netmask", "Unknown"),
-        "dns_server":       net.get("dns_server", "Unknown"),
+        "active_adapter": net.get("adapter") or net.get("interface") or "Unknown",
+        "adapter_name": net.get("adapter") or net.get("interface") or "Unknown",
+        "detected_subnet": net.get("subnet", "Unknown"),
+        "local_ip": net.get("local_ip", "Unknown"),
+        "gateway": net.get("gateway", "Unknown"),
+        "netmask": net.get("netmask", "Unknown"),
+        "dns_server": net.get("dns_server", "Unknown"),
         "detection_method": net.get("detection_method", "unknown"),
-        "is_admin":         admin,
-        "nmap_available":   nmap_path is not None,
-        "nmap_path":        nmap_path or None,
-        "npcap_available":  npcap_available,
-        "scapy_available":  scapy_available,
-        "arp_hosts":        len(arp_ips),
-        "arp_host_list":    arp_ips,
-        "limitations":      limitations,
-        "discovery_methods": [
-            "ARP Table Passive Scan",
+        "is_admin": True,
+        "nmap_available": nmap_path is not None,
+        "nmap_path": nmap_path,
+        "npcap_available": npcap_available,
+        "scapy_available": scapy_available,
+        "arp_hosts": len(arp_ips),
+        "arp_host_list": arp_ips,
+        "limitations": limitations,
+        "discovery_methods": list(filter(None, [
+            "Scapy ARP Sweep" if scapy_available else None,
+            "OS ARP Table (passive)",
             "Nmap Active Network Scan" if nmap_path else None,
-            "ICMP Ping Sweep" if admin else None,
-            "SYN Stealth Scan" if (admin and npcap_available and nmap_path) else None,
-        ]
+            "ICMP Ping Sweep",
+            "SYN Stealth Scan" if (npcap_available and nmap_path) else None,
+        ])),
     }

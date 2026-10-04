@@ -818,6 +818,7 @@ async function loadDevices() {
                   <i class="fa-solid fa-circle" style="font-size:6px"></i>
                   ${d.status === 'up' ? 'Online' : 'Offline'}
                 </span>
+                ${d.randomized_mac ? '<span class="badge badge-private" title="Privacy-preserving randomized MAC"><i class="fa-solid fa-shield-halved"></i> Private MAC</span>' : ''}
                 <span class="badge ${d.max_risk === 'High' ? 'badge-high' : d.max_risk === 'Medium' ? 'badge-medium' : 'badge-low'}">
                   ${d.max_risk} Risk
                 </span>
@@ -964,7 +965,11 @@ async function openDeviceModal(deviceId) {
         $('modal-hostname').textContent = d.hostname || 'No hostname recorded';
         $('modal-vendor').textContent   = d.vendor   || '—';
         $('modal-type').textContent     = d.device_type;
-        $('modal-mac').textContent      = d.mac_address || '—';
+        if (d.randomized_mac) {
+            $('modal-mac').innerHTML    = `${d.mac_address || '—'} <span class="badge badge-private" style="margin-left:6px" title="Device uses randomized MAC for privacy"><i class="fa-solid fa-shield-halved"></i> Private MAC</span>`;
+        } else {
+            $('modal-mac').textContent  = d.mac_address || '—';
+        }
         $('modal-os').textContent       = d.os_name  || '—';
         $('modal-first-seen').textContent = d.first_seen || '—';
         $('modal-last-seen').textContent  = d.last_seen  || '—';
@@ -1208,10 +1213,10 @@ async function loadHistory() {
             </td>
             <td>
               <div style="display:flex;gap:6px;">
-                <button class="btn btn-ghost btn-sm" onclick="viewScanDetails(${s.id})" title="Details">
+                <button class="btn btn-ghost btn-icon-sm" onclick="viewScanDetails(${s.id})" title="Details">
                   <i class="fa-solid fa-eye"></i>
                 </button>
-                <button class="btn btn-danger btn-sm" onclick="deleteScanRecord(${s.id})" title="Delete">
+                <button class="btn btn-danger btn-icon-sm" onclick="deleteScanRecord(${s.id})" title="Delete">
                   <i class="fa-solid fa-trash"></i>
                 </button>
               </div>
