@@ -77,10 +77,7 @@ const gaugeLabel     = $('gauge-label');
 const scanForm       = $('scan-form');
 const scanTarget     = $('scan-target');
 const scanSimulation = $('scan-simulation');
-const scanBtnRow     = $('scan-btn-row');
 const startScanBtn   = $('start-scan-btn');
-const scanBtnIcon    = $('scan-btn-icon');
-const scanBtnText    = $('scan-btn-text');
 const progressCard   = $('scan-progress-card');
 const resultsCard    = $('scan-results-card');
 const scanPlaceholder= $('scanner-placeholder');
@@ -97,28 +94,6 @@ const btnExpandSubnet= $('btn-expand-subnet');
 const nmapNote       = $('nmap-status-note');
 const nmapNoteText   = $('nmap-status-text');
 const abortScanBtn   = $('abort-scan-btn');
-
-// Interactive helper: Set target IP from quick guide chips
-window.setTargetIp = function(ip) {
-    if (!scanTarget) return;
-    scanTarget.value = ip;
-    scanTarget.focus();
-    scanTarget.dispatchEvent(new Event('input'));
-    toast(`Target scope set to: ${ip}`, 'info');
-};
-
-// Interactive helper: Reset terminal console logs
-window.resetTerminalLogs = function() {
-    if (!consoleLogs) return;
-    consoleLogs.innerHTML = `
-      <div class="log-line" style="color:#38bdf8;font-weight:600;" id="terminal-ready-line">[System] Ready to scan — configure target and press Launch Scan.</div>
-      <div class="log-line success terminal-boot-line" id="terminal-nmap-line"><span style="color:#34d399;font-weight:700">✔</span> [Scanner] Nmap is detected — live scanning engine active.</div>
-      <div class="log-line info terminal-boot-line">[GuardNet] Security daemon initialized. Interface telemetry active.</div>
-      <div class="terminal-cursor-line">
-        <span class="terminal-prompt">guardian@net</span><span class="terminal-cursor">▮</span>
-      </div>
-    `;
-};
 
 // Router discovery panel
 const routerModel    = $('router-model');
@@ -325,33 +300,9 @@ async function initAppData() {
             adminText.textContent = 'Standard Mode';
         }
 
-        const termPill     = $('terminal-nmap-pill');
-        const termLabel    = $('terminal-nmap-label');
-        const termNmapLine = $('terminal-nmap-line');
-        const termReadyLine= $('terminal-ready-line');
-
         if (net.nmap_available) {
-            if (nmapNote) {
-                nmapNote.style.display   = 'flex';
-                nmapNoteText.textContent = ' Nmap detected — real scanning active';
-            }
-            if (termPill) termPill.classList.remove('inactive');
-            if (termLabel) termLabel.textContent = 'Nmap Detected';
-            if (termNmapLine) {
-                termNmapLine.className = 'log-line success terminal-boot-line';
-                termNmapLine.innerHTML = `<span style="color:#34d399;font-weight:700">✔</span> [Scanner] Nmap binary detected — live scanning engine active.`;
-            }
-        } else {
-            if (termPill) termPill.classList.add('inactive');
-            if (termLabel) termLabel.textContent = 'Socket Mode';
-            if (termNmapLine) {
-                termNmapLine.className = 'log-line warning terminal-boot-line';
-                termNmapLine.innerHTML = `<span style="color:#f59e0b;font-weight:700">⚠</span> [Scanner] Nmap not found on PATH — Python socket engine active.`;
-            }
-        }
-
-        if (termReadyLine) {
-            termReadyLine.innerHTML = `[System] Ready to scan — target: <span style="color:#06b6d4;font-weight:600">${scanTarget.value || '192.168.0.0/24'}</span>.`;
+            nmapNote.style.display   = 'block';
+            nmapNoteText.textContent = ' Nmap detected — real scanning active';
         }
 
         setOnline(true);
@@ -1523,11 +1474,6 @@ if (abortScanBtn) {
                 clearInterval(activeScanTimer);
                 activeScanId = null;
                 activeScanTimer = null;
-                const abortNotice = document.createElement('div');
-                abortNotice.className = 'log-line warning';
-                abortNotice.innerHTML = '<strong>[System]</strong> Active scan aborted by operator.';
-                consoleLogs.appendChild(abortNotice);
-                consoleLogs.scrollTop = consoleLogs.scrollHeight;
                 toast('Scan aborted.', 'warning');
                 resetScanUI();
             } catch (e) {
@@ -1555,24 +1501,14 @@ scanForm.addEventListener('submit', async (e) => {
     }
 
     subnetPrompt.classList.remove('visible');
-
-    // Button split animation: Launch shrinks to left, Abort appears in front
-    if (scanBtnRow) scanBtnRow.classList.add('scanning');
     startScanBtn.disabled  = true;
-    startScanBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> <span>Scanning…</span>';
-    if (abortScanBtn) abortScanBtn.disabled = false;
+    startScanBtn.innerHTML = '<i class="fa-solid fa-circle-notch spin"></i> <span>Scanning…</span>';
+    if (abortScanBtn) abortScanBtn.style.display = 'flex';
 
-    // Terminal GUI stays permanently open and visible!
+    scanPlaceholder.style.display  = 'none';
     progressCard.style.display     = 'block';
     resultsCard.style.display      = 'none';
-
-    // Append scan start message to the active terminal
-    const scanStartDiv = document.createElement('div');
-    scanStartDiv.className = 'log-line info';
-    scanStartDiv.innerHTML = `<strong>[Scanner]</strong> Initiated ${profile.toUpperCase()} scan targeting <code>${target}</code>…`;
-    consoleLogs.appendChild(scanStartDiv);
-    consoleLogs.scrollTop = consoleLogs.scrollHeight;
-
+    consoleLogs.innerHTML          = '<div class="log-line">[System] Queued scan job…</div>';
     scanFill.style.width           = '0%';
     scanPct.textContent            = '0%';
     scanStateText.textContent      = 'Queued…';
@@ -1726,16 +1662,9 @@ async function showScanResults(scanId) {
 }
 
 function resetScanUI() {
-    if (scanBtnRow) scanBtnRow.classList.remove('scanning');
     startScanBtn.disabled  = false;
-    startScanBtn.innerHTML = '<i class="fa-solid fa-satellite-dish"></i> <span>Launch Scan</span>';
-    if (abortScanBtn) abortScanBtn.disabled = true;
-
-    const ind = consoleLogs ? consoleLogs.querySelector('.scan-running-indicator') : null;
-    if (ind) ind.remove();
-
-    const etaText = document.getElementById('scan-eta-text');
-    if (etaText) etaText.style.display = 'none';
+    startScanBtn.innerHTML = '<i class="fa-solid fa-satellite-dish"></i><span>Launch Scan</span>';
+    if (abortScanBtn) abortScanBtn.style.display = 'none';
 }
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
