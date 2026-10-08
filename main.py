@@ -18,14 +18,9 @@ from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, List
 
-try:
-    from . import database
-    from . import scanner
-    from . import alerts_sender
-except ImportError:
-    import database
-    import scanner
-    import alerts_sender
+from network_security_scanner.backend import database
+from network_security_scanner.backend import scanner
+from network_security_scanner.backend import alerts_sender
 
 
 
@@ -579,7 +574,7 @@ def export_data(export_format: str):
 
 # ─── Frontend Static Serve ────────────────────────────────────────────────────
 
-frontend_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")
+frontend_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "network_security_scanner", "frontend")
 if os.path.exists(frontend_path):
     app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
 else:

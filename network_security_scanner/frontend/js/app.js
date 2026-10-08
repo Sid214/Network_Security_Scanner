@@ -72,7 +72,6 @@ const backendStatus  = $('backend-status');
 const gaugeCircle    = $('gauge-circle');
 const gaugeScore     = $('gauge-score');
 const gaugeLabel     = $('gauge-label');
-const dashboardEmpty = $('dashboard-empty');
 
 // Scanner
 const scanForm       = $('scan-form');
@@ -744,7 +743,7 @@ async function loadDevices() {
         devicesGrid.innerHTML = '';
 
         if (!devices.length) {
-            devicesEmpty.style.display = 'block';
+            devicesEmpty.style.display = 'flex';
             $('devices-actions-bar').style.display = 'none';
             return;
         }
@@ -844,7 +843,7 @@ async function loadDevices() {
         updateDeviceSelectionState();
     } catch (e) {
         devicesGrid.innerHTML = '';
-        devicesEmpty.style.display = 'block';
+        devicesEmpty.style.display = 'flex';
         $('devices-actions-bar').style.display = 'none';
         toast('Failed to load devices list.', 'error');
     }

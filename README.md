@@ -52,13 +52,13 @@ python -m venv .venv
 
 ### 2. Install Dependencies
 ```bash
-pip install -r network_security_scanner/backend/requirements.txt
+pip install -r requirements.txt
 ```
 
 ### 3. Start Platform Server
 Start the Uvicorn FastAPI server:
 ```bash
-python network_security_scanner/backend/main.py
+python main.py
 ```
 *Note: A background thread will automatically launch the browser client at `http://127.0.0.1:8000/`.*
 

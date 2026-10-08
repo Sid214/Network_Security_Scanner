@@ -346,17 +346,6 @@
           </div>
         </div>
 
-        <!-- Empty State Banner (shown when no scans exist) -->
-        <div id="dashboard-empty" class="card mt-4" style="display:none;text-align:center;padding:48px 24px;">
-          <i class="fa-solid fa-satellite-dish radar-pulse" style="font-size:48px;color:var(--brand-primary);display:block;margin-bottom:16px;"></i>
-          <h3 style="font-size:20px;font-weight:800;color:var(--text-primary);margin-bottom:8px;">No Scan Data Yet</h3>
-          <p style="color:var(--text-secondary);margin-bottom:24px;max-width:400px;margin-left:auto;margin-right:auto;">
-            Run your first scan to populate the dashboard with real network intelligence.
-          </p>
-          <button class="btn btn-primary" onclick="window.switchTab('scanner')">
-            <i class="fa-solid fa-satellite-dish"></i> Launch Network Scanner
-          </button>
-        </div>
 
       </section>
 
@@ -463,10 +452,7 @@
         <div id="devices-empty" class="empty-state" style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding: 48px 20px;">
           <i class="fa-solid fa-laptop-code" style="font-size: 32px; color: var(--text-muted); margin-bottom: 12px; display: block;"></i>
           <h3 style="font-size:16px; font-weight: 700; color: var(--text-secondary); margin-bottom: 6px;">No Devices Found</h3>
-          <p style="text-align:center; margin:0 auto 16px auto; font-size:13px; color:var(--text-muted);">Run a scan from the Network Scanner tab to discover devices on your network.</p>
-          <button class="btn btn-primary" onclick="window.switchTab('scanner')" style="display:inline-flex;align-items:center;gap:6px;margin:0 auto;width:fit-content;">
-            <i class="fa-solid fa-satellite-dish"></i> Open Scanner
-          </button>
+          <p style="text-align:center; margin:0 auto; font-size:13px; color:var(--text-muted);">Run a scan from the Network Scanner tab to discover devices on your network.</p>
         </div>
       </section>
 
@@ -641,21 +627,6 @@
           </div>
         </div>
 
-        <!-- Discovery Diagnostics Panel -->
-        <div class="card" id="discovery-diagnostics-card" style="margin-top:16px;">
-          <div class="card-header" style="cursor:pointer" id="diagnostics-toggle">
-            <div>
-              <div class="card-title"><i class="fa-solid fa-stethoscope" style="color:var(--brand-primary);margin-right:8px"></i>Discovery Diagnostics</div>
-              <div class="card-subtitle" style="color:var(--text-secondary)">Adapter, privilege, and capability status for this scan session</div>
-            </div>
-            <i class="fa-solid fa-chevron-down" id="diagnostics-chevron" style="color:var(--text-muted);transition:transform 0.2s"></i>
-          </div>
-          <div id="diagnostics-body" style="display:none;">
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;padding-top:8px;" id="diagnostics-grid">
-              <div style="text-align:center;padding:24px;color:var(--text-muted)"><i class="fa-solid fa-circle-notch spin"></i> Loading diagnostics…</div>
-            </div>
-          </div>
-        </div>
       </section>
 
 
